@@ -1,6 +1,7 @@
 import argparse
 
 from planner import write_plan
+from recorder import run_record
 from scanner import run_scan
 
 
@@ -30,6 +31,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="planner mode",
     )
     plan_parser.set_defaults(handler=handle_plan)
+
+    record_parser = subparsers.add_parser("record", help="record a browser walkthrough from plan.json")
+    record_parser.add_argument("plan_json", help="path to a planner output JSON file")
+    record_parser.add_argument("--output", help="optional recording JSON output path")
+    record_parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="show the browser while recording",
+    )
+    record_parser.add_argument(
+        "--timeout-ms",
+        default=10_000,
+        type=int,
+        help="action timeout in milliseconds",
+    )
+    record_parser.add_argument(
+        "--slow-mo-ms",
+        default=0,
+        type=int,
+        help="slow down Playwright actions by this many milliseconds",
+    )
+    record_parser.set_defaults(handler=handle_record)
 
     return parser
 
@@ -68,6 +91,26 @@ def handle_plan(args: argparse.Namespace) -> int:
     print(f"Scenes: {len(scenes)}")
     for scene in scenes:
         print(f"- {scene['scene_id']}: {scene['title']}")
+    return 0
+
+
+def handle_record(args: argparse.Namespace) -> int:
+    result = run_record(
+        args.plan_json,
+        output_path=args.output,
+        headless=not args.headed,
+        action_timeout_ms=args.timeout_ms,
+        slow_mo_ms=args.slow_mo_ms,
+    )
+
+    successful_actions = [action for action in result["actions"] if action["status"] == "success"]
+    print(f"Recording {result['status']}: {result['job_id']}")
+    print(f"Recording JSON: {result['artifacts']['recording_json']}")
+    print(f"Video: {result['artifacts']['video']}")
+    print(f"Actions: {len(successful_actions)}/{len(result['actions'])} succeeded")
+    if result["failure"]:
+        print(f"Failure: {result['failure'].get('message')}")
+        return 1
     return 0
 
 
