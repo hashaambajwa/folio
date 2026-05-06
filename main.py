@@ -1,5 +1,6 @@
 import argparse
 
+from planner import write_plan
 from scanner import run_scan
 
 
@@ -18,6 +19,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="page navigation timeout in milliseconds",
     )
     scan_parser.set_defaults(handler=handle_scan)
+
+    plan_parser = subparsers.add_parser("plan", help="generate a demo plan from scan.json")
+    plan_parser.add_argument("scan_json", help="path to a scanner output JSON file")
+    plan_parser.add_argument("--output", help="optional plan JSON output path")
+    plan_parser.add_argument(
+        "--mode",
+        choices=["heuristic"],
+        default="heuristic",
+        help="planner mode",
+    )
+    plan_parser.set_defaults(handler=handle_plan)
 
     return parser
 
@@ -43,6 +55,19 @@ def handle_scan(args: argparse.Namespace) -> int:
         f"{len(dom['links'])} links, "
         f"{len(dom['forms'])} forms"
     )
+    return 0
+
+
+def handle_plan(args: argparse.Namespace) -> int:
+    plan = write_plan(args.scan_json, output_path=args.output, mode=args.mode)
+
+    scenes = plan["scenes"]
+    print(f"Plan complete: {plan['job_id']}")
+    print(f"Mode: {plan['planner']['mode']}")
+    print(f"Plan JSON: {plan['artifacts']['plan_json']}")
+    print(f"Scenes: {len(scenes)}")
+    for scene in scenes:
+        print(f"- {scene['scene_id']}: {scene['title']}")
     return 0
 
 
