@@ -2,6 +2,7 @@ import argparse
 
 from planner import write_plan
 from recorder import run_record
+from renderer import render
 from scanner import run_scan
 
 
@@ -53,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="slow down Playwright actions by this many milliseconds",
     )
     record_parser.set_defaults(handler=handle_record)
+
+    render_parser = subparsers.add_parser("render", help="render final MP4 from recording.json")
+    render_parser.add_argument("recording_json", help="path to a recorder output JSON file")
+    render_parser.add_argument("--output", help="optional MP4 output path")
+    render_parser.add_argument("--report", help="optional render JSON report path")
+    render_parser.add_argument("--ffmpeg-path", help="explicit path to an ffmpeg binary")
+    render_parser.add_argument("--crf", default=23, type=int, help="x264 quality value")
+    render_parser.add_argument("--preset", default="veryfast", help="x264 encoding preset")
+    render_parser.set_defaults(handler=handle_render)
 
     return parser
 
@@ -110,6 +120,25 @@ def handle_record(args: argparse.Namespace) -> int:
     print(f"Actions: {len(successful_actions)}/{len(result['actions'])} succeeded")
     if result["failure"]:
         print(f"Failure: {result['failure'].get('message')}")
+        return 1
+    return 0
+
+
+def handle_render(args: argparse.Namespace) -> int:
+    result = render(
+        args.recording_json,
+        output_video_path=args.output,
+        report_path=args.report,
+        ffmpeg_path=args.ffmpeg_path,
+        crf=args.crf,
+        preset=args.preset,
+    )
+
+    print(f"Render {result['status']}: {result['job_id']}")
+    print(f"Render JSON: {result['artifacts']['render_json']}")
+    print(f"Video: {result['artifacts']['video']}")
+    if result["failure"]:
+        print(f"Failure: {result['failure']['message']}")
         return 1
     return 0
 
