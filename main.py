@@ -6,6 +6,16 @@ from planner import write_plan
 from recorder import run_record
 from renderer import render
 from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, run_scan
+from source_context import (
+    MAX_COMPONENTS,
+    MAX_FILE_CHARS,
+    MAX_README_CHARS,
+    MAX_README_FILES,
+    MAX_ROUTES,
+    MAX_SOURCE_FILES,
+    MAX_TREE_ENTRIES,
+    MAX_UI_STRINGS,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +58,56 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--source-root",
         help="optional local app source directory to summarize for planning",
+    )
+    scan_parser.add_argument(
+        "--source-max-tree",
+        default=MAX_TREE_ENTRIES,
+        dest="source_max_tree_entries",
+        type=int,
+        help="maximum source tree paths to keep",
+    )
+    scan_parser.add_argument(
+        "--source-max-files",
+        default=MAX_SOURCE_FILES,
+        type=int,
+        help="maximum source files to inspect",
+    )
+    scan_parser.add_argument(
+        "--source-max-readme-chars",
+        default=MAX_README_CHARS,
+        type=int,
+        help="maximum characters to keep per README",
+    )
+    scan_parser.add_argument(
+        "--source-max-readmes",
+        default=MAX_README_FILES,
+        dest="source_max_readme_files",
+        type=int,
+        help="maximum README files to keep",
+    )
+    scan_parser.add_argument(
+        "--source-max-routes",
+        default=MAX_ROUTES,
+        type=int,
+        help="maximum route candidates to keep",
+    )
+    scan_parser.add_argument(
+        "--source-max-components",
+        default=MAX_COMPONENTS,
+        type=int,
+        help="maximum component candidates to keep",
+    )
+    scan_parser.add_argument(
+        "--source-max-ui-strings",
+        default=MAX_UI_STRINGS,
+        type=int,
+        help="maximum UI string candidates to keep",
+    )
+    scan_parser.add_argument(
+        "--source-max-file-chars",
+        default=MAX_FILE_CHARS,
+        type=int,
+        help="maximum characters to inspect per source file",
     )
     scan_parser.set_defaults(handler=handle_scan)
 
@@ -112,6 +172,14 @@ def handle_scan(args: argparse.Namespace) -> int:
         max_states=args.max_states,
         max_actions_per_state=args.max_actions_per_state,
         source_root=args.source_root,
+        source_max_tree_entries=args.source_max_tree_entries,
+        source_max_files=args.source_max_files,
+        source_max_readme_files=args.source_max_readme_files,
+        source_max_readme_chars=args.source_max_readme_chars,
+        source_max_routes=args.source_max_routes,
+        source_max_components=args.source_max_components,
+        source_max_ui_strings=args.source_max_ui_strings,
+        source_max_file_chars=args.source_max_file_chars,
     )
 
     dom = result["dom"]
@@ -125,12 +193,14 @@ def handle_scan(args: argparse.Namespace) -> int:
     source_context = result.get("source_context")
     if source_context:
         summary = source_context.get("summary", {})
+        diagnostics = source_context.get("diagnostics", {})
         print(
             "Source context: "
             f"{source_context.get('status')} "
-            f"({summary.get('source_file_count', 0)} source files, "
+            f"({summary.get('source_files_inspected', 0)}/{summary.get('source_file_count', 0)} source files inspected, "
             f"{summary.get('route_count', 0)} routes, "
-            f"{summary.get('component_count', 0)} components)"
+            f"{summary.get('component_count', 0)} components, "
+            f"truncated={diagnostics.get('truncated', False)})"
         )
     print(
         "Elements: "

@@ -11,7 +11,17 @@ from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from source_context import build_source_context
+from source_context import (
+    MAX_COMPONENTS,
+    MAX_FILE_CHARS,
+    MAX_README_CHARS,
+    MAX_README_FILES,
+    MAX_ROUTES,
+    MAX_SOURCE_FILES,
+    MAX_TREE_ENTRIES,
+    MAX_UI_STRINGS,
+    build_source_context,
+)
 
 
 DEFAULT_VIEWPORT = {"width": 1440, "height": 900}
@@ -62,6 +72,14 @@ async def scan(
     max_states: int = DEFAULT_MAX_STATES,
     max_actions_per_state: int = DEFAULT_MAX_ACTIONS_PER_STATE,
     source_root: str | Path | None = None,
+    source_max_tree_entries: int = MAX_TREE_ENTRIES,
+    source_max_files: int = MAX_SOURCE_FILES,
+    source_max_readme_files: int = MAX_README_FILES,
+    source_max_readme_chars: int = MAX_README_CHARS,
+    source_max_routes: int = MAX_ROUTES,
+    source_max_components: int = MAX_COMPONENTS,
+    source_max_ui_strings: int = MAX_UI_STRINGS,
+    source_max_file_chars: int = MAX_FILE_CHARS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -74,7 +92,17 @@ async def scan(
     viewport = dict(viewport or DEFAULT_VIEWPORT)
     states: list[dict] = []
     transitions: list[dict] = []
-    source_context = build_source_context(source_root)
+    source_context = build_source_context(
+        source_root,
+        max_tree_entries=source_max_tree_entries,
+        max_source_files=source_max_files,
+        max_readme_files=source_max_readme_files,
+        max_readme_chars=source_max_readme_chars,
+        max_routes=source_max_routes,
+        max_components=source_max_components,
+        max_ui_strings=source_max_ui_strings,
+        max_file_chars=source_max_file_chars,
+    )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -134,6 +162,18 @@ async def scan(
             "max_states": max_states,
             "max_actions_per_state": max_actions_per_state,
             "source_root": str(source_root) if source_root else None,
+            "source_limits": {
+                "max_tree_entries": source_max_tree_entries,
+                "max_source_files": source_max_files,
+                "max_readme_files": source_max_readme_files,
+                "max_readme_chars": source_max_readme_chars,
+                "max_routes": source_max_routes,
+                "max_components": source_max_components,
+                "max_ui_strings": source_max_ui_strings,
+                "max_file_chars": source_max_file_chars,
+            }
+            if source_root
+            else None,
         },
         "page": {
             "title": title,

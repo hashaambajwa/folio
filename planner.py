@@ -341,9 +341,11 @@ def _source_context_for_llm(source_context: dict | None) -> dict | None:
         "status": source_context.get("status"),
         "root_name": source_context.get("root_name"),
         "summary": source_context.get("summary", {}),
+        "diagnostics": source_context.get("diagnostics", {}),
         "framework_hints": source_context.get("framework_hints", []),
         "package": source_context.get("package"),
         "tree": source_context.get("tree", [])[:160],
+        "inspected_files": source_context.get("inspected_files", [])[:80],
         "readmes": [
             {
                 "path": readme.get("path"),

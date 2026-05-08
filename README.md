@@ -72,6 +72,16 @@ Add `--source-root` when you also have the app code locally. Folio will add a bo
 python main.py scan https://example.com --source-root /path/to/app
 ```
 
+The source collector prioritizes route/page files, app entry points, and likely components before spending the remaining file budget. If a larger app is clipped, increase the relevant budget and check `source_context.diagnostics` in `scan.json`.
+
+```bash
+python main.py scan https://example.com \
+  --source-root /path/to/app \
+  --source-max-files 500 \
+  --source-max-tree 400 \
+  --source-max-routes 150
+```
+
 ## LLM Planner
 
 The deterministic planner is the default because it works without credentials:
