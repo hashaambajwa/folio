@@ -13,6 +13,9 @@ from playwright.async_api import async_playwright
 
 DEFAULT_VIEWPORT = {"width": 1440, "height": 900}
 MAX_ELEMENTS_PER_GROUP = 100
+MAX_TEXT_BLOCKS = 80
+MAX_ACCESSIBILITY_NODES = 120
+MAX_ACCESSIBILITY_DEPTH = 4
 
 
 def build_job_id(url: str) -> str:
@@ -58,6 +61,7 @@ async def scan(
 
             title = await page.title()
             dom_summary = await page.evaluate(_dom_summary_script())
+            accessibility_snapshot = await page.accessibility.snapshot(interesting_only=True)
             final_url = page.url
             await page.screenshot(path=str(screenshot_path), full_page=True)
         finally:
@@ -82,6 +86,7 @@ async def scan(
             "scan_json": str(scan_path),
         },
         "dom": dom_summary,
+        "accessibility": _prune_accessibility_tree(accessibility_snapshot),
         "browser_errors": {
             "console": console_errors,
             "page": page_errors,
@@ -112,15 +117,52 @@ def _capture_console_errors(console_errors: list[dict]):
     return capture
 
 
+def _prune_accessibility_tree(
+    node: dict | None,
+    max_nodes: int = MAX_ACCESSIBILITY_NODES,
+    max_depth: int = MAX_ACCESSIBILITY_DEPTH,
+) -> dict | None:
+    if not node:
+        return None
+
+    count = 0
+
+    def prune(current: dict, depth: int) -> dict | None:
+        nonlocal count
+        if count >= max_nodes or depth > max_depth:
+            return None
+
+        count += 1
+        pruned = {
+            key: current[key]
+            for key in ("role", "name", "value", "description", "level", "checked", "selected", "disabled")
+            if key in current
+        }
+
+        children = []
+        for child in current.get("children", []):
+            pruned_child = prune(child, depth + 1)
+            if pruned_child:
+                children.append(pruned_child)
+
+        if children:
+            pruned["children"] = children
+
+        return pruned
+
+    return prune(node, 0)
+
+
 def _dom_summary_script() -> str:
     return f"""
     () => {{
       const maxElements = {MAX_ELEMENTS_PER_GROUP};
+      const maxTextBlocks = {MAX_TEXT_BLOCKS};
 
       const cleanText = (value) => (value || "")
         .replace(/\\s+/g, " ")
         .trim()
-        .slice(0, 160);
+        .slice(0, 240);
 
       const isVisible = (element) => {{
         const rect = element.getBoundingClientRect();
@@ -209,16 +251,73 @@ def _dom_summary_script() -> str:
         }};
       }};
 
+      const labelFor = (element) => {{
+        const labels = [];
+        if (element.id) {{
+          const explicitLabel = document.querySelector(`label[for="${{CSS.escape(element.id)}}"]`);
+          if (explicitLabel) labels.push(explicitLabel.innerText);
+        }}
+
+        const wrappingLabel = element.closest("label");
+        if (wrappingLabel) labels.push(wrappingLabel.innerText);
+
+        return cleanText(labels.find((label) => cleanText(label)) || "");
+      }};
+
+      const formContextFor = (element) => {{
+        const form = element.closest("form");
+        if (!form) return null;
+
+        const heading = form.querySelector("h1, h2, h3, legend");
+        return {{
+          selectors: selectorCandidates(form),
+          label: cleanText(heading ? heading.innerText : ""),
+          method: (form.method || "get").toLowerCase(),
+          action: form.action || null,
+        }};
+      }};
+
+      const attributesFor = (element) => {{
+        const classNames = Array.from(element.classList || []).slice(0, 8);
+        return {{
+          id: element.id || null,
+          class_names: classNames,
+          data_testid: element.getAttribute("data-testid"),
+          data_test: element.getAttribute("data-test"),
+          data_cy: element.getAttribute("data-cy"),
+          aria_label: element.getAttribute("aria-label"),
+          aria_expanded: element.getAttribute("aria-expanded"),
+          aria_controls: element.getAttribute("aria-controls"),
+          placeholder: element.getAttribute("placeholder"),
+          autocomplete: element.getAttribute("autocomplete"),
+          disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+          required: Boolean(element.required || element.getAttribute("aria-required") === "true"),
+          readonly: Boolean(element.readOnly),
+          checked: typeof element.checked === "boolean" ? element.checked : null,
+          selected: typeof element.selected === "boolean" ? element.selected : null,
+        }};
+      }};
+
       const describe = (element) => {{
         const tag = element.tagName.toLowerCase();
+        const label = cleanText(
+          element.getAttribute("aria-label")
+          || labelFor(element)
+          || element.getAttribute("placeholder")
+          || element.getAttribute("title")
+        );
+        const text = cleanText(element.innerText || element.value || element.getAttribute("aria-label"));
         return {{
           tag,
           type: element.getAttribute("type"),
           role: element.getAttribute("role"),
-          text: cleanText(element.innerText || element.value || element.getAttribute("aria-label")),
-          label: cleanText(element.getAttribute("aria-label") || element.getAttribute("placeholder") || element.getAttribute("title")),
+          text,
+          label,
+          accessible_name: label || text,
           name: element.getAttribute("name"),
           href: element.href || null,
+          attributes: attributesFor(element),
+          form_context: formContextFor(element),
           selectors: selectorCandidates(element),
           bounds: boundsFor(element),
         }};
@@ -242,7 +341,24 @@ def _dom_summary_script() -> str:
             .map(describe),
         }}));
 
+      const textBlocks = Array.from((document.body?.innerText || "").split("\\n"))
+        .map(cleanText)
+        .filter((text) => text.length > 1)
+        .slice(0, maxTextBlocks);
+
+      const interactive = collect('button, [role="button"], a[href], input:not([type="hidden"]), textarea, select, summary, [tabindex]:not([tabindex="-1"])')
+        .sort((left, right) => {{
+          if (left.bounds.y !== right.bounds.y) return left.bounds.y - right.bounds.y;
+          return left.bounds.x - right.bounds.x;
+        }});
+
       return {{
+        summary: {{
+          visible_text_block_count: textBlocks.length,
+          heading_count: collect("h1, h2, h3").length,
+          interactive_count: interactive.length,
+        }},
+        text_blocks: textBlocks,
         headings: collect("h1, h2, h3").map((heading) => ({{
           level: heading.tag,
           text: heading.text,
@@ -253,6 +369,7 @@ def _dom_summary_script() -> str:
         links: collect("a[href]"),
         inputs: collect('input:not([type="hidden"]), textarea, select'),
         forms,
+        interactive,
       }};
     }}
     """
