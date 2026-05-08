@@ -301,6 +301,7 @@ def _llm_system_prompt() -> str:
         "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
         "Use only selectors present in the provided scan context for click, fill, and press actions. "
         "Use discovered states and transitions to understand UI that appears after interaction. "
+        "Use source_context when provided to infer the app's intended routes, features, and product language. "
         "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
     )
 
@@ -316,6 +317,7 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "summary": dom.get("summary", {}),
         "headings": dom.get("headings", [])[:20],
         "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
+        "source_context": _source_context_for_llm(scan.get("source_context")),
         "states": [
             _state_for_llm(state)
             for state in scan.get("states", [])[:10]
@@ -328,6 +330,30 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "accessibility": scan.get("accessibility"),
         "browser_errors": scan.get("browser_errors", {}),
         "supported_action_types": ["observe", "click", "fill", "press"],
+    }
+
+
+def _source_context_for_llm(source_context: dict | None) -> dict | None:
+    if not source_context:
+        return None
+
+    return {
+        "status": source_context.get("status"),
+        "root_name": source_context.get("root_name"),
+        "summary": source_context.get("summary", {}),
+        "framework_hints": source_context.get("framework_hints", []),
+        "package": source_context.get("package"),
+        "tree": source_context.get("tree", [])[:160],
+        "readmes": [
+            {
+                "path": readme.get("path"),
+                "text": (readme.get("text") or "")[:2_500],
+            }
+            for readme in source_context.get("readmes", [])[:2]
+        ],
+        "routes": source_context.get("routes", [])[:60],
+        "components": source_context.get("components", [])[:80],
+        "ui_strings": source_context.get("ui_strings", [])[:80],
     }
 
 
