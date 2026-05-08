@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
+from source_context import build_source_context
+
 
 DEFAULT_VIEWPORT = {"width": 1440, "height": 900}
 MAX_ELEMENTS_PER_GROUP = 100
@@ -59,6 +61,7 @@ async def scan(
     probe_depth: int = DEFAULT_PROBE_DEPTH,
     max_states: int = DEFAULT_MAX_STATES,
     max_actions_per_state: int = DEFAULT_MAX_ACTIONS_PER_STATE,
+    source_root: str | Path | None = None,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -71,6 +74,7 @@ async def scan(
     viewport = dict(viewport or DEFAULT_VIEWPORT)
     states: list[dict] = []
     transitions: list[dict] = []
+    source_context = build_source_context(source_root)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -129,6 +133,7 @@ async def scan(
             "probe_depth": probe_depth,
             "max_states": max_states,
             "max_actions_per_state": max_actions_per_state,
+            "source_root": str(source_root) if source_root else None,
         },
         "page": {
             "title": title,
@@ -144,6 +149,7 @@ async def scan(
         "accessibility": initial_state["accessibility"],
         "states": states,
         "transitions": transitions,
+        "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
             "page": page_errors,

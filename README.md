@@ -66,6 +66,12 @@ python main.py scan https://example.com --probe-depth 3 --max-states 16 --max-ac
 
 Use `--no-probes` when you only want the first loaded page state.
 
+Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
+
+```bash
+python main.py scan https://example.com --source-root /path/to/app
+```
+
 ## LLM Planner
 
 The deterministic planner is the default because it works without credentials:

@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="capture only the initial page state",
     )
+    scan_parser.add_argument(
+        "--source-root",
+        help="optional local app source directory to summarize for planning",
+    )
     scan_parser.set_defaults(handler=handle_scan)
 
     plan_parser = subparsers.add_parser("plan", help="generate a demo plan from scan.json")
@@ -107,6 +111,7 @@ def handle_scan(args: argparse.Namespace) -> int:
         probe_depth=0 if args.no_probes else args.probe_depth,
         max_states=args.max_states,
         max_actions_per_state=args.max_actions_per_state,
+        source_root=args.source_root,
     )
 
     dom = result["dom"]
@@ -117,6 +122,16 @@ def handle_scan(args: argparse.Namespace) -> int:
     print(f"Scan JSON: {result['artifacts']['scan_json']}")
     print(f"States: {len(result.get('states', []))}")
     print(f"Transitions: {len(result.get('transitions', []))}")
+    source_context = result.get("source_context")
+    if source_context:
+        summary = source_context.get("summary", {})
+        print(
+            "Source context: "
+            f"{source_context.get('status')} "
+            f"({summary.get('source_file_count', 0)} source files, "
+            f"{summary.get('route_count', 0)} routes, "
+            f"{summary.get('component_count', 0)} components)"
+        )
     print(
         "Elements: "
         f"{len(dom['buttons'])} buttons, "
