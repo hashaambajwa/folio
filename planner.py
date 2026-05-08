@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 PLAN_VERSION = "0.1"
+DEFAULT_LLM_MODEL = "gpt-5.1"
 MAX_BUTTON_SCENES = 3
+MAX_LLM_TEXT_BLOCKS = 40
+MAX_LLM_INTERACTIVE_ELEMENTS = 60
 
 
 def load_scan(scan_path: str | Path) -> dict:
@@ -20,30 +26,72 @@ def build_plan(
     scan_path: str | Path | None = None,
     output_path: str | Path | None = None,
     mode: str = "heuristic",
+    llm_model: str | None = None,
+    fallback_to_heuristic: bool = True,
 ) -> dict:
-    if mode != "heuristic":
+    if mode not in {"heuristic", "llm"}:
         raise ValueError(f"Unsupported planner mode: {mode}")
 
     scan_path = Path(scan_path) if scan_path else None
+    if mode == "llm":
+        return _build_llm_plan(
+            scan,
+            scan_path=scan_path,
+            output_path=output_path,
+            model=llm_model,
+            fallback_to_heuristic=fallback_to_heuristic,
+        )
+
+    return _build_heuristic_plan(scan, scan_path=scan_path, output_path=output_path)
+
+
+def _build_heuristic_plan(
+    scan: dict,
+    scan_path: Path | None = None,
+    output_path: str | Path | None = None,
+    planner_overrides: dict | None = None,
+) -> dict:
     plan_path = _default_plan_path(scan, scan_path, output_path)
     page = scan.get("page", {})
     dom = scan.get("dom", {})
     title = _page_title(page, dom)
     scenes = _build_heuristic_scenes(scan)
+    planner = {
+        "mode": "heuristic",
+        "confidence": "fallback",
+        "needs_review": True,
+        "notes": [
+            "Heuristic plan generated without app-specific reasoning.",
+            "LLM planner should replace or refine these scenes before production use.",
+        ],
+    }
+    if planner_overrides:
+        planner.update(planner_overrides)
 
+    return _assemble_plan(
+        scan=scan,
+        scan_path=scan_path,
+        plan_path=plan_path,
+        title=title,
+        scenes=scenes,
+        planner=planner,
+    )
+
+
+def _assemble_plan(
+    scan: dict,
+    scan_path: Path | None,
+    plan_path: Path,
+    title: str,
+    scenes: list[dict],
+    planner: dict,
+) -> dict:
+    page = scan.get("page", {})
     return {
         "version": PLAN_VERSION,
         "job_id": scan.get("job_id"),
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "planner": {
-            "mode": mode,
-            "confidence": "fallback",
-            "needs_review": True,
-            "notes": [
-                "Heuristic plan generated without app-specific reasoning.",
-                "LLM planner should replace or refine these scenes before production use.",
-            ],
-        },
+        "planner": planner,
         "source": {
             "scan_json": str(scan_path) if scan_path else scan.get("artifacts", {}).get("scan_json"),
             "screenshot": scan.get("artifacts", {}).get("screenshot"),
@@ -69,13 +117,326 @@ def write_plan(
     scan_path: str | Path,
     output_path: str | Path | None = None,
     mode: str = "heuristic",
+    llm_model: str | None = None,
+    fallback_to_heuristic: bool = True,
 ) -> dict:
     scan = load_scan(scan_path)
-    plan = build_plan(scan, scan_path=scan_path, output_path=output_path, mode=mode)
+    plan = build_plan(
+        scan,
+        scan_path=scan_path,
+        output_path=output_path,
+        mode=mode,
+        llm_model=llm_model,
+        fallback_to_heuristic=fallback_to_heuristic,
+    )
     plan_path = Path(plan["artifacts"]["plan_json"])
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
     return plan
+
+
+def _build_llm_plan(
+    scan: dict,
+    scan_path: Path | None,
+    output_path: str | Path | None,
+    model: str | None,
+    fallback_to_heuristic: bool,
+) -> dict:
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return _handle_llm_failure(
+            scan,
+            scan_path=scan_path,
+            output_path=output_path,
+            fallback_to_heuristic=fallback_to_heuristic,
+            model=model,
+            error="Missing OPENAI_API_KEY.",
+        )
+
+    try:
+        llm_payload = _call_openai_planner(scan, api_key=api_key, model=model)
+        scenes = _normalize_llm_scenes(llm_payload)
+        if not scenes:
+            raise ValueError("LLM response did not include usable scenes.")
+
+        plan_path = _default_plan_path(scan, scan_path, output_path)
+        title = _page_title(scan.get("page", {}), scan.get("dom", {}))
+        return _assemble_plan(
+            scan=scan,
+            scan_path=scan_path,
+            plan_path=plan_path,
+            title=title,
+            scenes=scenes,
+            planner={
+                "mode": "llm",
+                "provider": "openai",
+                "model": model,
+                "confidence": "llm",
+                "needs_review": True,
+                "fallback_used": False,
+                "notes": [
+                    "LLM-generated plan using scanner DOM, accessibility, and visible text context.",
+                    "Review selectors before using on high-stakes demos.",
+                ],
+                "rationale": llm_payload.get("rationale", ""),
+            },
+        )
+    except Exception as exc:
+        return _handle_llm_failure(
+            scan,
+            scan_path=scan_path,
+            output_path=output_path,
+            fallback_to_heuristic=fallback_to_heuristic,
+            model=model,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _handle_llm_failure(
+    scan: dict,
+    scan_path: Path | None,
+    output_path: str | Path | None,
+    fallback_to_heuristic: bool,
+    model: str,
+    error: str,
+) -> dict:
+    if not fallback_to_heuristic:
+        raise RuntimeError(error)
+
+    return _build_heuristic_plan(
+        scan,
+        scan_path=scan_path,
+        output_path=output_path,
+        planner_overrides={
+            "mode": "llm",
+            "provider": "openai",
+            "model": model,
+            "confidence": "fallback",
+            "needs_review": True,
+            "fallback_used": True,
+            "error": error,
+            "notes": [
+                "LLM planner failed, so Folio generated a heuristic fallback plan.",
+                "Set OPENAI_API_KEY to enable real LLM planning.",
+            ],
+        },
+    )
+
+
+def _call_openai_planner(scan: dict, api_key: str, model: str) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(_scan_context_for_llm(scan), indent=2),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_demo_plan",
+                "strict": True,
+                "schema": _llm_plan_schema(),
+            }
+        },
+        "max_output_tokens": 4_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
+def _extract_openai_output_text(body: dict) -> str:
+    if body.get("output_text"):
+        return body["output_text"]
+
+    chunks = []
+    for item in body.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                chunks.append(content["text"])
+    return "".join(chunks)
+
+
+def _llm_system_prompt() -> str:
+    return (
+        "You are Folio's demo planner. Create a concise browser demo plan that showcases "
+        "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
+        "Use only selectors present in the provided scan context for click, fill, and press actions. "
+        "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
+    )
+
+
+def _scan_context_for_llm(scan: dict) -> dict:
+    dom = scan.get("dom", {})
+    return {
+        "page": scan.get("page", {}),
+        "source": {
+            "url": scan.get("input", {}).get("url"),
+            "final_url": scan.get("page", {}).get("final_url"),
+        },
+        "summary": dom.get("summary", {}),
+        "headings": dom.get("headings", [])[:20],
+        "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
+        "interactive": [
+            _element_for_llm(element, index)
+            for index, element in enumerate(dom.get("interactive", [])[:MAX_LLM_INTERACTIVE_ELEMENTS], 1)
+        ],
+        "accessibility": scan.get("accessibility"),
+        "browser_errors": scan.get("browser_errors", {}),
+        "supported_action_types": ["observe", "click", "fill", "press"],
+    }
+
+
+def _element_for_llm(element: dict, index: int) -> dict:
+    return {
+        "index": index,
+        "tag": element.get("tag"),
+        "type": element.get("type"),
+        "role": element.get("role"),
+        "text": element.get("text"),
+        "label": element.get("label"),
+        "accessible_name": element.get("accessible_name"),
+        "href": element.get("href"),
+        "selectors": element.get("selectors", []),
+        "attributes": element.get("attributes", {}),
+        "bounds": element.get("bounds", {}),
+    }
+
+
+def _llm_plan_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "scenes"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "scenes": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "scene_id",
+                        "title",
+                        "type",
+                        "goal",
+                        "duration_seconds",
+                        "actions",
+                        "success_criteria",
+                        "narration_hint",
+                    ],
+                    "properties": {
+                        "scene_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "type": {"type": "string", "enum": ["intro", "interaction", "overview", "outro"]},
+                        "goal": {"type": "string"},
+                        "duration_seconds": {"type": "integer", "minimum": 2, "maximum": 12},
+                        "success_criteria": {"type": "string"},
+                        "narration_hint": {"type": "string"},
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["action_id", "type", "description", "selector", "value", "key"],
+                                "properties": {
+                                    "action_id": {"type": "string"},
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press"]},
+                                    "description": {"type": "string"},
+                                    "selector": {"type": ["string", "null"]},
+                                    "value": {"type": ["string", "null"]},
+                                    "key": {"type": ["string", "null"]},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def _normalize_llm_scenes(payload: dict) -> list[dict]:
+    scenes = []
+    for scene in payload.get("scenes", []):
+        actions = [_normalize_llm_action(action) for action in scene.get("actions", [])]
+        actions = [action for action in actions if action]
+        if not actions:
+            actions = [
+                {
+                    "action_id": "observe-scene",
+                    "type": "observe",
+                    "description": "Show this scene state.",
+                }
+            ]
+
+        scene_id = _slug(scene.get("scene_id") or scene.get("title") or f"scene-{len(scenes) + 1}")
+        scenes.append(
+            _scene(
+                scene_id=scene_id,
+                title=(scene.get("title") or scene_id).strip(),
+                goal=(scene.get("goal") or "Show this part of the app.").strip(),
+                scene_type=scene.get("type") if scene.get("type") in {"intro", "interaction", "overview", "outro"} else "overview",
+                duration_seconds=int(scene.get("duration_seconds") or 5),
+                actions=actions,
+                success_criteria=(scene.get("success_criteria") or "The scene completes without errors.").strip(),
+                narration_hint=(scene.get("narration_hint") or "Explain what the viewer is seeing.").strip(),
+            )
+        )
+    return scenes
+
+
+def _normalize_llm_action(action: dict) -> dict | None:
+    action_type = action.get("type")
+    if action_type not in {"observe", "click", "fill", "press"}:
+        return None
+
+    normalized = {
+        "action_id": _slug(action.get("action_id") or action_type),
+        "type": action_type,
+        "description": (action.get("description") or f"{action_type} action").strip(),
+    }
+    selector = action.get("selector")
+    if action_type in {"click", "fill", "press"}:
+        if not selector:
+            return None
+        normalized["selector"] = selector
+    if action_type == "fill":
+        normalized["value"] = action.get("value") or "Demo value"
+    if action_type == "press":
+        normalized["key"] = action.get("key") or "Enter"
+    return normalized
 
 
 def _default_plan_path(

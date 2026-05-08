@@ -55,3 +55,20 @@ renderer.py -> final.mp4 + render.json
 ```
 
 Generated artifacts live under `outputs/` and are ignored by git.
+
+## LLM Planner
+
+The deterministic planner is the default because it works without credentials:
+
+```bash
+python main.py plan outputs/smoke/scan.json --mode heuristic
+```
+
+To try the OpenAI-backed planner, set an API key and run:
+
+```bash
+export OPENAI_API_KEY=...
+python main.py plan outputs/smoke/scan.json --mode llm
+```
+
+By default, `--mode llm` falls back to the heuristic planner if the API key is missing or the model response cannot be used. Use `--no-fallback` when you want failures to stop the workflow.

@@ -29,9 +29,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--output", help="optional plan JSON output path")
     plan_parser.add_argument(
         "--mode",
-        choices=["heuristic"],
+        choices=["heuristic", "llm"],
         default="heuristic",
         help="planner mode",
+    )
+    plan_parser.add_argument("--llm-model", help="OpenAI model for --mode llm")
+    plan_parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="fail instead of using the heuristic planner if LLM planning fails",
     )
     plan_parser.set_defaults(handler=handle_plan)
 
@@ -94,11 +100,25 @@ def handle_scan(args: argparse.Namespace) -> int:
 
 
 def handle_plan(args: argparse.Namespace) -> int:
-    plan = write_plan(args.scan_json, output_path=args.output, mode=args.mode)
+    try:
+        plan = write_plan(
+            args.scan_json,
+            output_path=args.output,
+            mode=args.mode,
+            llm_model=args.llm_model,
+            fallback_to_heuristic=not args.no_fallback,
+        )
+    except RuntimeError as exc:
+        print(f"Plan failed: {exc}")
+        return 1
 
     scenes = plan["scenes"]
     print(f"Plan complete: {plan['job_id']}")
     print(f"Mode: {plan['planner']['mode']}")
+    if plan["planner"].get("model"):
+        print(f"Model: {plan['planner']['model']}")
+    if plan["planner"].get("fallback_used"):
+        print(f"Fallback: {plan['planner'].get('error')}")
     print(f"Plan JSON: {plan['artifacts']['plan_json']}")
     print(f"Scenes: {len(scenes)}")
     for scene in scenes:
