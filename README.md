@@ -56,6 +56,16 @@ renderer.py -> final.mp4 + render.json
 
 Generated artifacts live under `outputs/` and are ignored by git.
 
+## Scanner Exploration
+
+`scan` captures the initial page plus a bounded graph of post-interaction UI states. By default it probes up to 3 steps deep, keeps up to 16 discovered states, and tries up to 5 safe candidate actions per state.
+
+```bash
+python main.py scan https://example.com --probe-depth 3 --max-states 16 --max-actions-per-state 5
+```
+
+Use `--no-probes` when you only want the first loaded page state.
+
 ## LLM Planner
 
 The deterministic planner is the default because it works without credentials:

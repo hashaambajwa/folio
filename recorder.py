@@ -183,7 +183,15 @@ async def _execute_action(
             await page.wait_for_timeout(int(duration_seconds * 1000))
         elif action_type == "click":
             locator = await _ready_locator(page, action, action_timeout_ms)
-            await locator.click(timeout=action_timeout_ms)
+            try:
+                await locator.click(timeout=action_timeout_ms)
+            except Exception:
+                if not action.get("allow_hidden"):
+                    raise
+                await page.evaluate(
+                    "(selector) => document.querySelector(selector)?.click()",
+                    action.get("selector"),
+                )
             await _wait_for_settle(page)
         elif action_type == "fill":
             locator = await _ready_locator(page, action, action_timeout_ms)
@@ -212,8 +220,10 @@ async def _ready_locator(page, action: dict, action_timeout_ms: int):
         raise ValueError("Action requires a selector")
 
     locator = page.locator(selector).first
-    await locator.wait_for(state="visible", timeout=action_timeout_ms)
-    await locator.scroll_into_view_if_needed(timeout=action_timeout_ms)
+    wait_state = "attached" if action.get("allow_hidden") else "visible"
+    await locator.wait_for(state=wait_state, timeout=action_timeout_ms)
+    if not action.get("allow_hidden"):
+        await locator.scroll_into_view_if_needed(timeout=action_timeout_ms)
     return locator
 
 

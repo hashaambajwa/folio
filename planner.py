@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 PLAN_VERSION = "0.1"
 DEFAULT_LLM_MODEL = "gpt-5.1"
 MAX_BUTTON_SCENES = 3
+MAX_TRANSITION_SCENES = 5
 MAX_LLM_TEXT_BLOCKS = 40
 MAX_LLM_INTERACTIVE_ELEMENTS = 60
 
@@ -299,6 +300,7 @@ def _llm_system_prompt() -> str:
         "You are Folio's demo planner. Create a concise browser demo plan that showcases "
         "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
         "Use only selectors present in the provided scan context for click, fill, and press actions. "
+        "Use discovered states and transitions to understand UI that appears after interaction. "
         "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
     )
 
@@ -314,6 +316,11 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "summary": dom.get("summary", {}),
         "headings": dom.get("headings", [])[:20],
         "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
+        "states": [
+            _state_for_llm(state)
+            for state in scan.get("states", [])[:10]
+        ],
+        "transitions": scan.get("transitions", [])[:30],
         "interactive": [
             _element_for_llm(element, index)
             for index, element in enumerate(dom.get("interactive", [])[:MAX_LLM_INTERACTIVE_ELEMENTS], 1)
@@ -321,6 +328,25 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "accessibility": scan.get("accessibility"),
         "browser_errors": scan.get("browser_errors", {}),
         "supported_action_types": ["observe", "click", "fill", "press"],
+    }
+
+
+def _state_for_llm(state: dict) -> dict:
+    dom = state.get("dom", {})
+    return {
+        "state_id": state.get("state_id"),
+        "url": state.get("url"),
+        "depth": state.get("depth"),
+        "parent_state_id": state.get("parent_state_id"),
+        "transition": state.get("transition"),
+        "summary": dom.get("summary", {}),
+        "headings": dom.get("headings", [])[:12],
+        "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
+        "interactive": [
+            _element_for_llm(element, index)
+            for index, element in enumerate(dom.get("interactive", [])[:MAX_LLM_INTERACTIVE_ELEMENTS], 1)
+        ],
+        "accessibility": state.get("accessibility"),
     }
 
 
@@ -474,22 +500,161 @@ def _build_heuristic_scenes(scan: dict) -> list[dict]:
     title = _page_title(page, dom)
     scenes = [_intro_scene(title, page.get("final_url"))]
 
-    primary_input = _first_actionable_input(dom.get("inputs", []))
-    if primary_input:
-        scenes.append(_input_scene(primary_input))
+    transition_scenes = _transition_path_scenes(scan)
+    if transition_scenes:
+        scenes.extend(transition_scenes)
+    else:
+        primary_input = _first_actionable_input(dom.get("inputs", []))
+        if primary_input:
+            scenes.append(_input_scene(primary_input))
 
-    for index, button in enumerate(_meaningful_buttons(dom.get("buttons", []))[:MAX_BUTTON_SCENES], 1):
-        scenes.append(_button_scene(button, index))
+        for index, button in enumerate(_meaningful_buttons(dom.get("buttons", []))[:MAX_BUTTON_SCENES], 1):
+            scenes.append(_button_scene(button, index))
 
-    links = _meaningful_links(dom.get("links", []))
-    if links:
-        scenes.append(_navigation_scene(links[:5]))
+        links = _meaningful_links(dom.get("links", []))
+        if links:
+            scenes.append(_navigation_scene(links[:5]))
 
     if len(scenes) == 1:
         scenes.append(_static_walkthrough_scene(dom))
 
     scenes.append(_outro_scene(title))
     return scenes
+
+
+def _transition_path_scenes(scan: dict) -> list[dict]:
+    state = _best_transition_state(scan)
+    if not state:
+        return []
+
+    states_by_id = {
+        candidate.get("state_id"): candidate
+        for candidate in scan.get("states", [])
+        if candidate.get("state_id")
+    }
+    transitions = _state_path_transitions(state, states_by_id)
+    scenes = []
+    for index, transition in enumerate(transitions[:MAX_TRANSITION_SCENES], 1):
+        scene = _transition_scene(transition, index)
+        if scene:
+            scenes.append(scene)
+    return scenes
+
+
+def _best_transition_state(scan: dict) -> dict | None:
+    states = [
+        state
+        for state in scan.get("states", [])
+        if state.get("state_id") != "initial" and state.get("replay_actions")
+    ]
+    if not states:
+        return None
+
+    start_url = scan.get("page", {}).get("final_url") or scan.get("input", {}).get("url")
+    states_by_id = {
+        state.get("state_id"): state
+        for state in scan.get("states", [])
+        if state.get("state_id")
+    }
+
+    def score(state: dict) -> tuple:
+        transitions = _state_path_transitions(state, states_by_id)
+        kinds = {transition.get("kind") for transition in transitions if transition.get("kind")}
+        action_types = {
+            action.get("type")
+            for action in state.get("replay_actions", [])
+            if action.get("type")
+        }
+        same_path_bonus = 8 if _same_url_path(start_url, state.get("url")) else 0
+        route_penalty = 0 if _same_url_origin(start_url, state.get("url")) else -20
+        fragment_bonus = _route_fragment_bonus(state.get("url"))
+        return (
+            same_path_bonus + route_penalty + fragment_bonus + len(kinds) * 4 + len(action_types) * 2,
+            len(transitions),
+            len(state.get("replay_actions", [])),
+        )
+
+    return max(states, key=score)
+
+
+def _state_path_transitions(state: dict, states_by_id: dict[str, dict]) -> list[dict]:
+    transitions = []
+    current = state
+    seen = set()
+    while current and current.get("state_id") not in seen:
+        seen.add(current.get("state_id"))
+        transition = current.get("transition")
+        if transition:
+            transitions.append(transition)
+        parent_id = current.get("parent_state_id")
+        current = states_by_id.get(parent_id)
+
+    return list(reversed(transitions))
+
+
+def _transition_scene(transition: dict, index: int) -> dict | None:
+    actions = [
+        _probe_action_for_plan(action, transition, action_index)
+        for action_index, action in enumerate(transition.get("actions", []), 1)
+    ]
+    actions = [action for action in actions if action]
+    if not actions:
+        return None
+
+    kind = transition.get("kind") or "interaction"
+    label = transition.get("label") or kind
+    clean_label = _clean_transition_label(label)
+    return _scene(
+        scene_id=f"probe-{index}-{_slug(clean_label)}",
+        title=_transition_title(kind, clean_label),
+        goal=f"Show the app response for {clean_label}.",
+        scene_type="interaction",
+        duration_seconds=6,
+        actions=actions,
+        success_criteria="The interaction completes and the next UI state is visible.",
+        narration_hint=f"Explain what changes after {clean_label}.",
+        source_transition=transition,
+    )
+
+
+def _probe_action_for_plan(action: dict, transition: dict, index: int) -> dict | None:
+    action_type = action.get("type")
+    if action_type not in {"observe", "click", "fill", "press"}:
+        return None
+
+    planned = {
+        "action_id": f"{_slug(transition.get('candidate_id') or transition.get('label') or 'probe')}-{index}",
+        "type": action_type,
+        "description": action.get("description") or f"{action_type} during probe.",
+    }
+    if action_type in {"click", "fill", "press"}:
+        selector = action.get("selector")
+        if not selector:
+            return None
+        planned["selector"] = selector
+    if action_type == "fill":
+        planned["value"] = action.get("value") or "Demo value"
+    if action_type == "press":
+        planned["key"] = action.get("key") or "Enter"
+    if action.get("allow_hidden"):
+        planned["allow_hidden"] = True
+    return planned
+
+
+def _clean_transition_label(label: str) -> str:
+    return re.sub(r"\s+", " ", label).strip() or "interaction"
+
+
+def _transition_title(kind: str, label: str) -> str:
+    if kind == "input_submit":
+        return label.capitalize()
+    if kind == "toggle":
+        if label.lower().startswith("toggle"):
+            return label
+        return f"Toggle {label}"
+    if kind == "click":
+        return f"Open {label}"
+    return label.capitalize()
 
 
 def _intro_scene(title: str, final_url: str | None) -> dict:
@@ -687,6 +852,30 @@ def _host_for(url: str | None) -> str | None:
     return urlparse(url).netloc or None
 
 
+def _same_url_origin(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+
+    parsed_left = urlparse(left)
+    parsed_right = urlparse(right)
+    return parsed_left.scheme == parsed_right.scheme and parsed_left.netloc == parsed_right.netloc
+
+
+def _same_url_path(left: str | None, right: str | None) -> bool:
+    if not _same_url_origin(left, right):
+        return False
+
+    return urlparse(left).path == urlparse(right).path
+
+
+def _route_fragment_bonus(url: str | None) -> int:
+    if not url:
+        return 0
+
+    fragment = urlparse(url).fragment.strip("/")
+    return 2 if fragment else 0
+
+
 def _first_actionable_input(inputs: list[dict]) -> dict | None:
     ignored_types = {"button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"}
     for element in inputs:
@@ -725,7 +914,7 @@ def _sample_value_for_input(element: dict) -> str:
 
 
 def _element_name(element: dict, fallback: str = "") -> str:
-    for key in ("text", "label", "name"):
+    for key in ("accessible_name", "text", "label", "name"):
         value = (element.get(key) or "").strip()
         if value:
             return value

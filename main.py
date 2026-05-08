@@ -5,7 +5,7 @@ import argparse
 from planner import write_plan
 from recorder import run_record
 from renderer import render
-from scanner import run_scan
+from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, run_scan
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +21,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=30_000,
         type=int,
         help="page navigation timeout in milliseconds",
+    )
+    scan_parser.add_argument(
+        "--probe-depth",
+        default=DEFAULT_PROBE_DEPTH,
+        type=int,
+        help="maximum UI exploration depth after the initial scan",
+    )
+    scan_parser.add_argument(
+        "--max-states",
+        default=DEFAULT_MAX_STATES,
+        type=int,
+        help="maximum discovered UI states to capture",
+    )
+    scan_parser.add_argument(
+        "--max-actions-per-state",
+        default=DEFAULT_MAX_ACTIONS_PER_STATE,
+        type=int,
+        help="maximum probe candidates to try from each state",
+    )
+    scan_parser.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="capture only the initial page state",
     )
     scan_parser.set_defaults(handler=handle_scan)
 
@@ -81,6 +104,9 @@ def handle_scan(args: argparse.Namespace) -> int:
         output_root=args.output_root,
         job_id=args.job_id,
         timeout_ms=args.timeout_ms,
+        probe_depth=0 if args.no_probes else args.probe_depth,
+        max_states=args.max_states,
+        max_actions_per_state=args.max_actions_per_state,
     )
 
     dom = result["dom"]
@@ -89,6 +115,8 @@ def handle_scan(args: argparse.Namespace) -> int:
     print(f"Final URL: {result['page']['final_url']}")
     print(f"Screenshot: {result['artifacts']['screenshot']}")
     print(f"Scan JSON: {result['artifacts']['scan_json']}")
+    print(f"States: {len(result.get('states', []))}")
+    print(f"Transitions: {len(result.get('transitions', []))}")
     print(
         "Elements: "
         f"{len(dom['buttons'])} buttons, "
