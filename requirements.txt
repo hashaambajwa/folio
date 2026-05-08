@@ -1,1 +1,2 @@
+certifi==2026.4.22
 playwright==1.48.0

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -259,7 +260,7 @@ def _call_openai_planner(scan: dict, api_key: str, model: str) -> dict:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=60, context=_https_context()) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -270,6 +271,15 @@ def _call_openai_planner(scan: dict, api_key: str, model: str) -> dict:
         raise RuntimeError("OpenAI response did not include output text.")
 
     return json.loads(output_text)
+
+
+def _https_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
 
 
 def _extract_openai_output_text(body: dict) -> str:
