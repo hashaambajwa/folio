@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 
 from planner import write_plan
