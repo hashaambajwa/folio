@@ -8,6 +8,7 @@ from renderer import render
 from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, run_scan
 from source_context import (
     MAX_COMPONENTS,
+    MAX_FILE_BYTES,
     MAX_FILE_CHARS,
     MAX_README_CHARS,
     MAX_README_FILES,
@@ -109,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="maximum characters to inspect per source file",
     )
+    scan_parser.add_argument(
+        "--source-max-file-bytes",
+        default=MAX_FILE_BYTES,
+        type=int,
+        help="maximum byte size for a source file before it is skipped",
+    )
     scan_parser.set_defaults(handler=handle_scan)
 
     plan_parser = subparsers.add_parser("plan", help="generate a demo plan from scan.json")
@@ -180,6 +187,7 @@ def handle_scan(args: argparse.Namespace) -> int:
         source_max_components=args.source_max_components,
         source_max_ui_strings=args.source_max_ui_strings,
         source_max_file_chars=args.source_max_file_chars,
+        source_max_file_bytes=args.source_max_file_bytes,
     )
 
     dom = result["dom"]
@@ -194,12 +202,23 @@ def handle_scan(args: argparse.Namespace) -> int:
     if source_context:
         summary = source_context.get("summary", {})
         diagnostics = source_context.get("diagnostics", {})
+        skipped_count = sum(
+            diagnostics.get(key, 0)
+            for key in (
+                "skipped_symlinks",
+                "skipped_outside_root",
+                "skipped_large_files",
+                "skipped_unreadable_files",
+                "skipped_policy_files",
+            )
+        )
         print(
             "Source context: "
             f"{source_context.get('status')} "
             f"({summary.get('source_files_inspected', 0)}/{summary.get('source_file_count', 0)} source files inspected, "
             f"{summary.get('route_count', 0)} routes, "
             f"{summary.get('component_count', 0)} components, "
+            f"{skipped_count} skipped, "
             f"truncated={diagnostics.get('truncated', False)})"
         )
     print(

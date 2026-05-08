@@ -13,6 +13,7 @@ from playwright.async_api import async_playwright
 
 from source_context import (
     MAX_COMPONENTS,
+    MAX_FILE_BYTES,
     MAX_FILE_CHARS,
     MAX_README_CHARS,
     MAX_README_FILES,
@@ -80,6 +81,7 @@ async def scan(
     source_max_components: int = MAX_COMPONENTS,
     source_max_ui_strings: int = MAX_UI_STRINGS,
     source_max_file_chars: int = MAX_FILE_CHARS,
+    source_max_file_bytes: int = MAX_FILE_BYTES,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -102,6 +104,7 @@ async def scan(
         max_components=source_max_components,
         max_ui_strings=source_max_ui_strings,
         max_file_chars=source_max_file_chars,
+        max_file_bytes=source_max_file_bytes,
     )
 
     async with async_playwright() as p:
@@ -171,6 +174,7 @@ async def scan(
                 "max_components": source_max_components,
                 "max_ui_strings": source_max_ui_strings,
                 "max_file_chars": source_max_file_chars,
+                "max_file_bytes": source_max_file_bytes,
             }
             if source_root
             else None,

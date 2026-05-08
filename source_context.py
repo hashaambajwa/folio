@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 from pathlib import Path
 
@@ -15,6 +16,7 @@ MAX_ROUTES = 80
 MAX_COMPONENTS = 100
 MAX_UI_STRINGS = 120
 MAX_FILE_CHARS = 120_000
+MAX_FILE_BYTES = 1_000_000
 
 SKIP_DIRS = {
     ".cache",
@@ -89,6 +91,16 @@ class SourceContextLimits:
     max_components: int = MAX_COMPONENTS
     max_ui_strings: int = MAX_UI_STRINGS
     max_file_chars: int = MAX_FILE_CHARS
+    max_file_bytes: int = MAX_FILE_BYTES
+
+
+@dataclass
+class SourceScanStats:
+    skipped_symlinks: int = 0
+    skipped_outside_root: int = 0
+    skipped_large_files: int = 0
+    skipped_unreadable_files: int = 0
+    skipped_policy_files: int = 0
 
 
 def build_source_context(
@@ -101,6 +113,7 @@ def build_source_context(
     max_components: int = MAX_COMPONENTS,
     max_ui_strings: int = MAX_UI_STRINGS,
     max_file_chars: int = MAX_FILE_CHARS,
+    max_file_bytes: int = MAX_FILE_BYTES,
 ) -> dict | None:
     if not source_root:
         return None
@@ -114,15 +127,26 @@ def build_source_context(
         max_components=max(0, int(max_components)),
         max_ui_strings=max(0, int(max_ui_strings)),
         max_file_chars=max(0, int(max_file_chars)),
+        max_file_bytes=max(0, int(max_file_bytes)),
     )
 
-    root = Path(source_root).expanduser()
-    if not root.exists():
+    requested_root = Path(source_root).expanduser()
+    if not requested_root.exists():
         return {
             "version": SOURCE_CONTEXT_VERSION,
             "status": "error",
             "error": f"Source root does not exist: {source_root}",
         }
+
+    try:
+        root = requested_root.resolve(strict=True)
+    except OSError as exc:
+        return {
+            "version": SOURCE_CONTEXT_VERSION,
+            "status": "error",
+            "error": f"Source root could not be resolved: {type(exc).__name__}: {exc}",
+        }
+
     if not root.is_dir():
         return {
             "version": SOURCE_CONTEXT_VERSION,
@@ -130,15 +154,16 @@ def build_source_context(
             "error": f"Source root is not a directory: {source_root}",
         }
 
-    files = _walk_files(root)
+    stats = SourceScanStats()
+    files = _walk_files(root, limits, stats)
     all_source_files = [path for path in files if path.suffix.lower() in SOURCE_EXTENSIONS]
     source_files = _select_source_files(root, all_source_files, limits.max_source_files)
-    package_info = _package_info(root, limits)
+    package_info = _package_info(root, limits, stats)
     readme_files = _readme_files(files)
-    readmes = _readmes(root, readme_files, limits)
-    routes = _routes(root, source_files, limits)
-    components = _components(root, source_files, limits)
-    ui_strings = _ui_strings(root, source_files, limits)
+    readmes = _readmes(root, readme_files, limits, stats)
+    routes = _routes(root, source_files, limits, stats)
+    components = _components(root, source_files, limits, stats)
+    ui_strings = _ui_strings(root, source_files, limits, stats)
     framework_hints = _framework_hints(package_info, files)
     tree = _tree_entries(root, files, source_files, limits.max_tree_entries)
     diagnostics = _diagnostics(
@@ -152,6 +177,7 @@ def build_source_context(
         components=components,
         ui_strings=ui_strings,
         limits=limits,
+        stats=stats,
     )
 
     return {
@@ -168,6 +194,7 @@ def build_source_context(
             "max_components": limits.max_components,
             "max_ui_strings": limits.max_ui_strings,
             "max_file_chars": limits.max_file_chars,
+            "max_file_bytes": limits.max_file_bytes,
         },
         "summary": {
             "file_count": len(files),
@@ -191,35 +218,111 @@ def build_source_context(
     }
 
 
-def _walk_files(root: Path) -> list[Path]:
+def _walk_files(root: Path, limits: SourceContextLimits, stats: SourceScanStats) -> list[Path]:
     files = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if _is_skipped(root, path):
-            continue
-        files.append(path)
+    for current_dir, dirnames, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current_dir)
+        dirnames[:] = [
+            dirname
+            for dirname in sorted(dirnames)
+            if not _skip_directory(root, current_path / dirname, stats)
+        ]
+
+        for filename in sorted(filenames):
+            path = current_path / filename
+            if _is_skipped(root, path, limits, stats):
+                continue
+            files.append(path)
+
     return files
 
 
-def _is_skipped(root: Path, path: Path) -> bool:
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
+def _skip_directory(root: Path, path: Path, stats: SourceScanStats) -> bool:
+    if path.is_symlink():
+        stats.skipped_symlinks += 1
         return True
 
+    if path.name in SKIP_DIRS:
+        stats.skipped_policy_files += 1
+        return True
+
+    try:
+        resolved_path = path.resolve(strict=True)
+    except OSError:
+        stats.skipped_unreadable_files += 1
+        return True
+
+    if not _is_relative_to(resolved_path, root):
+        stats.skipped_outside_root += 1
+        return True
+
+    return False
+
+
+def _is_skipped(root: Path, path: Path, limits: SourceContextLimits, stats: SourceScanStats) -> bool:
+    if path.is_symlink():
+        stats.skipped_symlinks += 1
+        return True
+
+    try:
+        resolved_path = path.resolve(strict=True)
+    except OSError:
+        stats.skipped_unreadable_files += 1
+        return True
+
+    if not _is_relative_to(resolved_path, root):
+        stats.skipped_outside_root += 1
+        return True
+
+    if not path.is_file():
+        stats.skipped_policy_files += 1
+        return True
+
+    relative = resolved_path.relative_to(root)
     if any(part in SKIP_DIRS for part in relative.parts[:-1]):
+        stats.skipped_policy_files += 1
         return True
 
     name = path.name
     if name in SKIP_FILES:
+        stats.skipped_policy_files += 1
         return True
     if name.startswith(".env"):
+        stats.skipped_policy_files += 1
         return True
     if path.suffix.lower() in SKIP_EXTENSIONS:
+        stats.skipped_policy_files += 1
+        return True
+
+    if _file_too_large(path, limits):
+        stats.skipped_large_files += 1
         return True
 
     return False
+
+
+def _safe_file_exists(root: Path, path: Path, limits: SourceContextLimits, stats: SourceScanStats) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+
+    if _is_skipped(root, path, limits, stats):
+        return False
+    return path.is_file()
+
+
+def _file_too_large(path: Path, limits: SourceContextLimits) -> bool:
+    try:
+        return path.stat().st_size > limits.max_file_bytes
+    except OSError:
+        return True
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _select_source_files(root: Path, source_files: list[Path], limit: int) -> list[Path]:
@@ -291,11 +394,11 @@ def _append_path(items: list[str], seen: set[str], path: str, limit: int) -> Non
     items.append(path)
 
 
-def _package_info(root: Path, limits: SourceContextLimits) -> dict | None:
+def _package_info(root: Path, limits: SourceContextLimits, stats: SourceScanStats) -> dict | None:
     package_path = root / "package.json"
-    if package_path.exists():
+    if _safe_file_exists(root, package_path, limits, stats):
         try:
-            package = json.loads(package_path.read_text(encoding="utf-8"))
+            package = json.loads(_read_limited(root, package_path, limits, stats))
         except (OSError, json.JSONDecodeError):
             package = {}
 
@@ -312,9 +415,9 @@ def _package_info(root: Path, limits: SourceContextLimits) -> dict | None:
         }
 
     requirements_path = root / "requirements.txt"
-    if requirements_path.exists():
+    if _safe_file_exists(root, requirements_path, limits, stats):
         requirements = []
-        for line in _read_limited(requirements_path, limits).splitlines():
+        for line in _read_limited(root, requirements_path, limits, stats).splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 requirements.append(line)
@@ -334,17 +437,22 @@ def _readme_files(files: list[Path]) -> list[Path]:
     ]
 
 
-def _readmes(root: Path, readme_files: list[Path], limits: SourceContextLimits) -> list[dict]:
+def _readmes(
+    root: Path,
+    readme_files: list[Path],
+    limits: SourceContextLimits,
+    stats: SourceScanStats,
+) -> list[dict]:
     return [
         {
             "path": _rel(root, path),
-            "text": _read_limited(path, limits, limits.max_readme_chars),
+            "text": _read_limited(root, path, limits, stats, limits.max_readme_chars),
         }
         for path in readme_files[: limits.max_readme_files]
     ]
 
 
-def _routes(root: Path, source_files: list[Path], limits: SourceContextLimits) -> list[dict]:
+def _routes(root: Path, source_files: list[Path], limits: SourceContextLimits, stats: SourceScanStats) -> list[dict]:
     routes = []
     seen = set()
     for path in source_files:
@@ -355,7 +463,7 @@ def _routes(root: Path, source_files: list[Path], limits: SourceContextLimits) -
 
         if path.suffix.lower() not in FRONTEND_EXTENSIONS:
             continue
-        text = _read_limited(path, limits)
+        text = _read_limited(root, path, limits, stats)
         for route in _regex_routes(root, path, text):
             _append_unique(routes, seen, route, limits.max_routes)
             if len(routes) >= limits.max_routes:
@@ -440,7 +548,12 @@ def _regex_routes(root: Path, path: Path, text: str) -> list[dict]:
     return routes
 
 
-def _components(root: Path, source_files: list[Path], limits: SourceContextLimits) -> list[dict]:
+def _components(
+    root: Path,
+    source_files: list[Path],
+    limits: SourceContextLimits,
+    stats: SourceScanStats,
+) -> list[dict]:
     patterns = [
         (r"\bexport\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)", "default_function"),
         (r"\bexport\s+function\s+([A-Z][A-Za-z0-9_]*)", "function"),
@@ -453,7 +566,7 @@ def _components(root: Path, source_files: list[Path], limits: SourceContextLimit
     for path in source_files:
         if path.suffix.lower() not in {".astro", ".js", ".jsx", ".mjs", ".svelte", ".ts", ".tsx", ".vue"}:
             continue
-        text = _read_limited(path, limits)
+        text = _read_limited(root, path, limits, stats)
         for pattern, kind in patterns:
             for match in re.finditer(pattern, text):
                 item = {
@@ -468,13 +581,18 @@ def _components(root: Path, source_files: list[Path], limits: SourceContextLimit
     return components
 
 
-def _ui_strings(root: Path, source_files: list[Path], limits: SourceContextLimits) -> list[dict]:
+def _ui_strings(
+    root: Path,
+    source_files: list[Path],
+    limits: SourceContextLimits,
+    stats: SourceScanStats,
+) -> list[dict]:
     strings = []
     seen = set()
     for path in source_files:
         if path.suffix.lower() not in FRONTEND_EXTENSIONS:
             continue
-        text = _read_limited(path, limits)
+        text = _read_limited(root, path, limits, stats)
         for value, position in _candidate_ui_strings(text):
             cleaned = _clean_ui_string(value)
             if not _is_useful_ui_string(cleaned):
@@ -561,6 +679,7 @@ def _diagnostics(
     components: list[dict],
     ui_strings: list[dict],
     limits: SourceContextLimits,
+    stats: SourceScanStats,
 ) -> dict:
     flags = {
         "tree_truncated": len(files) > len(tree),
@@ -574,16 +693,32 @@ def _diagnostics(
         "files_seen": len(files),
         "source_files_seen": len(all_source_files),
         "source_files_inspected": len(source_files),
+        "skipped_symlinks": stats.skipped_symlinks,
+        "skipped_outside_root": stats.skipped_outside_root,
+        "skipped_large_files": stats.skipped_large_files,
+        "skipped_unreadable_files": stats.skipped_unreadable_files,
+        "skipped_policy_files": stats.skipped_policy_files,
         **flags,
         "truncated": any(flags.values()),
     }
 
 
-def _read_limited(path: Path, limits: SourceContextLimits, limit: int | None = None) -> str:
+def _read_limited(
+    root: Path,
+    path: Path,
+    limits: SourceContextLimits,
+    stats: SourceScanStats,
+    limit: int | None = None,
+) -> str:
+    if not _safe_file_exists(root, path, limits, stats):
+        return ""
+
     read_limit = limit if limit is not None else limits.max_file_chars
     try:
-        return path.read_text(encoding="utf-8", errors="ignore")[:read_limit]
+        with path.open("r", encoding="utf-8", errors="ignore") as file:
+            return file.read(read_limit)
     except OSError:
+        stats.skipped_unreadable_files += 1
         return ""
 
 

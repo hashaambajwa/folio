@@ -82,6 +82,8 @@ python main.py scan https://example.com \
   --source-max-routes 150
 ```
 
+For untrusted repositories, source scanning is read-only and refuses symlinks, files outside the resolved source root, and files larger than `--source-max-file-bytes`. Skipped file counts are reported in `source_context.diagnostics`.
+
 ## LLM Planner
 
 The deterministic planner is the default because it works without credentials:
