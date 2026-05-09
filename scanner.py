@@ -33,6 +33,7 @@ MAX_ACCESSIBILITY_DEPTH = 4
 DEFAULT_PROBE_DEPTH = 3
 DEFAULT_MAX_STATES = 16
 DEFAULT_MAX_ACTIONS_PER_STATE = 5
+MAX_CANDIDATE_PATHS = 30
 PROBE_ACTION_TIMEOUT_MS = 8_000
 RISK_WORDS = {
     "account",
@@ -94,6 +95,7 @@ async def scan(
     viewport = dict(viewport or DEFAULT_VIEWPORT)
     states: list[dict] = []
     transitions: list[dict] = []
+    candidate_paths: list[dict] = []
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -148,6 +150,7 @@ async def scan(
                     max_actions_per_state=max_actions_per_state,
                     timeout_ms=timeout_ms,
                 )
+                candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
             await browser.close()
@@ -193,6 +196,7 @@ async def scan(
         "accessibility": initial_state["accessibility"],
         "states": states,
         "transitions": transitions,
+        "candidate_paths": candidate_paths,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -446,6 +450,147 @@ def _action_candidates_for_state(state: dict, start_url: str) -> list[dict]:
     return sorted(candidates, key=lambda candidate: (candidate["priority"], candidate["bounds"].get("y", 0), candidate["bounds"].get("x", 0)))
 
 
+def _candidate_paths_for_states(start_url: str, states: list[dict]) -> list[dict]:
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    paths = []
+    for state in states:
+        if state.get("state_id") == "initial" or not state.get("replay_actions"):
+            continue
+
+        transitions = _state_path_transitions(state, states_by_id)
+        if not transitions:
+            continue
+
+        path = _candidate_path_for_state(start_url, state, transitions)
+        paths.append(path)
+
+    paths.sort(key=lambda path: (-path["score"], path["depth"], path["path_id"]))
+    return paths[:MAX_CANDIDATE_PATHS]
+
+
+def _state_path_transitions(state: dict, states_by_id: dict[str, dict]) -> list[dict]:
+    transitions = []
+    current = state
+    seen = set()
+    while current and current.get("state_id") not in seen:
+        seen.add(current.get("state_id"))
+        transition = current.get("transition")
+        if transition:
+            transitions.append(_path_transition(transition))
+        parent_id = current.get("parent_state_id")
+        current = states_by_id.get(parent_id)
+
+    return list(reversed(transitions))
+
+
+def _candidate_path_for_state(start_url: str, state: dict, transitions: list[dict]) -> dict:
+    labels = [transition.get("label") for transition in transitions if transition.get("label")]
+    kinds = sorted({transition.get("kind") for transition in transitions if transition.get("kind")})
+    replay_actions = state.get("replay_actions", [])
+    action_types = sorted({action.get("type") for action in replay_actions if action.get("type")})
+    final_url = state.get("url")
+    same_origin = _is_same_origin_url(final_url, start_url)
+    same_path = _same_url_path(final_url, start_url)
+    score, reasons = _candidate_path_score(
+        start_url=start_url,
+        final_url=final_url,
+        transitions=transitions,
+        kinds=kinds,
+        action_types=action_types,
+    )
+
+    return {
+        "path_id": f"path-{state.get('state_id')}",
+        "score": score,
+        "selection_reasons": reasons,
+        "start_state_id": "initial",
+        "final_state_id": state.get("state_id"),
+        "depth": state.get("depth"),
+        "final_url": final_url,
+        "same_origin": same_origin,
+        "same_path": same_path,
+        "route_fragment": urlparse(final_url or "").fragment,
+        "labels": labels,
+        "kinds": kinds,
+        "action_types": action_types,
+        "replay_actions": replay_actions,
+        "transitions": transitions,
+        "final_state_summary": _state_summary_for_path(state),
+    }
+
+
+def _path_transition(transition: dict) -> dict:
+    return {
+        "from": transition.get("from"),
+        "to": transition.get("to"),
+        "candidate_id": transition.get("candidate_id"),
+        "label": transition.get("label"),
+        "kind": transition.get("kind"),
+        "actions": transition.get("actions", []),
+        "status": transition.get("status"),
+    }
+
+
+def _candidate_path_score(
+    start_url: str,
+    final_url: str | None,
+    transitions: list[dict],
+    kinds: list[str],
+    action_types: list[str],
+) -> tuple[int, list[str]]:
+    score = len(transitions)
+    reasons = []
+
+    if _same_url_path(final_url, start_url):
+        score += 8
+        reasons.append("stays on the scanned app path")
+    elif _is_same_origin_url(final_url, start_url):
+        score -= 3
+        reasons.append("moves to a different same-origin path")
+    else:
+        score -= 20
+        reasons.append("leaves the scanned origin")
+
+    fragment = urlparse(final_url or "").fragment.strip("/")
+    if fragment:
+        score += 2
+        reasons.append(f"ends on route fragment {fragment}")
+
+    if kinds:
+        score += len(kinds) * 4
+        reasons.append(f"covers {', '.join(kinds)}")
+    if action_types:
+        score += len(action_types) * 2
+        reasons.append(f"uses {', '.join(action_types)} actions")
+
+    return score, reasons
+
+
+def _state_summary_for_path(state: dict) -> dict:
+    dom = state.get("dom", {})
+    return {
+        "title": state.get("title"),
+        "text_blocks": dom.get("text_blocks", [])[:16],
+        "headings": dom.get("headings", [])[:8],
+        "interactive": [
+            {
+                "name": _element_name(element),
+                "tag": element.get("tag"),
+                "type": element.get("type"),
+                "role": element.get("role"),
+                "selectors": element.get("selectors", [])[:2],
+                "checked": element.get("attributes", {}).get("checked"),
+                "disabled": element.get("attributes", {}).get("disabled"),
+            }
+            for element in dom.get("interactive", [])[:16]
+        ],
+    }
+
+
 def _input_submit_candidate(element: dict, priority: int) -> dict:
     selector = _first_selector(element)
     label = _element_name(element, fallback="input")
@@ -555,15 +700,27 @@ def _has_risk_word(label: str) -> bool:
 
 
 def _is_same_origin(href: str, start_url: str) -> bool:
-    parsed_href = urlparse(href)
-    parsed_start = urlparse(start_url)
-    return parsed_href.scheme == parsed_start.scheme and parsed_href.netloc == parsed_start.netloc
+    return _is_same_origin_url(href, start_url)
+
+
+def _is_same_origin_url(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+
+    parsed_left = urlparse(left)
+    parsed_right = urlparse(right)
+    return parsed_left.scheme == parsed_right.scheme and parsed_left.netloc == parsed_right.netloc
+
+
+def _same_url_path(left: str | None, right: str | None) -> bool:
+    if not _is_same_origin_url(left, right):
+        return False
+
+    return urlparse(left).path == urlparse(right).path
 
 
 def _same_page_or_hash_link(href: str, start_url: str) -> bool:
-    parsed_href = urlparse(href)
-    parsed_start = urlparse(start_url)
-    return _is_same_origin(href, start_url) and parsed_href.path == parsed_start.path
+    return _same_url_path(href, start_url)
 
 
 def _state_signature(url: str, dom: dict) -> str:

@@ -198,6 +198,7 @@ def handle_scan(args: argparse.Namespace) -> int:
     print(f"Scan JSON: {result['artifacts']['scan_json']}")
     print(f"States: {len(result.get('states', []))}")
     print(f"Transitions: {len(result.get('transitions', []))}")
+    print(f"Candidate paths: {len(result.get('candidate_paths', []))}")
     source_context = result.get("source_context")
     if source_context:
         summary = source_context.get("summary", {})

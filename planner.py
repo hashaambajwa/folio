@@ -15,6 +15,7 @@ PLAN_VERSION = "0.1"
 DEFAULT_LLM_MODEL = "gpt-5.1"
 MAX_BUTTON_SCENES = 3
 MAX_TRANSITION_SCENES = 5
+MAX_LLM_CANDIDATE_PATHS = 12
 MAX_LLM_TEXT_BLOCKS = 40
 MAX_LLM_INTERACTIVE_ELEMENTS = 60
 
@@ -69,6 +70,9 @@ def _build_heuristic_plan(
     }
     if planner_overrides:
         planner.update(planner_overrides)
+    selected_path = _best_candidate_path(scan)
+    if selected_path and "selected_path_id" not in planner:
+        planner["selected_path_id"] = selected_path.get("path_id")
 
     return _assemble_plan(
         scan=scan,
@@ -178,9 +182,10 @@ def _build_llm_plan(
                 "needs_review": True,
                 "fallback_used": False,
                 "notes": [
-                    "LLM-generated plan using scanner DOM, accessibility, and visible text context.",
+                    "LLM-generated plan using scanner DOM, source context, and replayable candidate paths.",
                     "Review selectors before using on high-stakes demos.",
                 ],
+                "selected_path_id": llm_payload.get("selected_path_id"),
                 "rationale": llm_payload.get("rationale", ""),
             },
         )
@@ -301,6 +306,7 @@ def _llm_system_prompt() -> str:
         "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
         "Use only selectors present in the provided scan context for click, fill, and press actions. "
         "Use discovered states and transitions to understand UI that appears after interaction. "
+        "Prefer selecting a replayable candidate_paths entry and copying its actions instead of inventing actions. "
         "Use source_context when provided to infer the app's intended routes, features, and product language. "
         "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
     )
@@ -318,6 +324,10 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "headings": dom.get("headings", [])[:20],
         "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
         "source_context": _source_context_for_llm(scan.get("source_context")),
+        "candidate_paths": [
+            _candidate_path_for_llm(path)
+            for path in scan.get("candidate_paths", [])[:MAX_LLM_CANDIDATE_PATHS]
+        ],
         "states": [
             _state_for_llm(state)
             for state in scan.get("states", [])[:10]
@@ -330,6 +340,26 @@ def _scan_context_for_llm(scan: dict) -> dict:
         "accessibility": scan.get("accessibility"),
         "browser_errors": scan.get("browser_errors", {}),
         "supported_action_types": ["observe", "click", "fill", "press"],
+    }
+
+
+def _candidate_path_for_llm(path: dict) -> dict:
+    return {
+        "path_id": path.get("path_id"),
+        "score": path.get("score"),
+        "selection_reasons": path.get("selection_reasons", []),
+        "final_state_id": path.get("final_state_id"),
+        "depth": path.get("depth"),
+        "final_url": path.get("final_url"),
+        "same_origin": path.get("same_origin"),
+        "same_path": path.get("same_path"),
+        "route_fragment": path.get("route_fragment"),
+        "labels": path.get("labels", []),
+        "kinds": path.get("kinds", []),
+        "action_types": path.get("action_types", []),
+        "replay_actions": path.get("replay_actions", []),
+        "transitions": path.get("transitions", []),
+        "final_state_summary": path.get("final_state_summary", {}),
     }
 
 
@@ -398,9 +428,10 @@ def _llm_plan_schema() -> dict:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["rationale", "scenes"],
+        "required": ["rationale", "selected_path_id", "scenes"],
         "properties": {
             "rationale": {"type": "string"},
+            "selected_path_id": {"type": ["string", "null"]},
             "scenes": {
                 "type": "array",
                 "minItems": 2,
@@ -433,7 +464,7 @@ def _llm_plan_schema() -> dict:
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": ["action_id", "type", "description", "selector", "value", "key"],
+                                "required": ["action_id", "type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
                                     "action_id": {"type": "string"},
                                     "type": {"type": "string", "enum": ["observe", "click", "fill", "press"]},
@@ -441,6 +472,7 @@ def _llm_plan_schema() -> dict:
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
                                     "key": {"type": ["string", "null"]},
+                                    "allow_hidden": {"type": "boolean"},
                                 },
                             },
                         },
@@ -500,6 +532,8 @@ def _normalize_llm_action(action: dict) -> dict | None:
         normalized["value"] = action.get("value") or "Demo value"
     if action_type == "press":
         normalized["key"] = action.get("key") or "Enter"
+    if action.get("allow_hidden"):
+        normalized["allow_hidden"] = True
     return normalized
 
 
@@ -551,6 +585,10 @@ def _build_heuristic_scenes(scan: dict) -> list[dict]:
 
 
 def _transition_path_scenes(scan: dict) -> list[dict]:
+    path = _best_candidate_path(scan)
+    if path:
+        return _transition_scenes_for_path(path.get("transitions", []), source_path_id=path.get("path_id"))
+
     state = _best_transition_state(scan)
     if not state:
         return []
@@ -561,9 +599,28 @@ def _transition_path_scenes(scan: dict) -> list[dict]:
         if candidate.get("state_id")
     }
     transitions = _state_path_transitions(state, states_by_id)
+    return _transition_scenes_for_path(transitions)
+
+
+def _best_candidate_path(scan: dict) -> dict | None:
+    paths = [path for path in scan.get("candidate_paths", []) if path.get("transitions")]
+    if not paths:
+        return None
+
+    return max(
+        paths,
+        key=lambda path: (
+            int(path.get("score") or 0),
+            int(path.get("depth") or 0),
+            len(path.get("replay_actions", [])),
+        ),
+    )
+
+
+def _transition_scenes_for_path(transitions: list[dict], source_path_id: str | None = None) -> list[dict]:
     scenes = []
     for index, transition in enumerate(transitions[:MAX_TRANSITION_SCENES], 1):
-        scene = _transition_scene(transition, index)
+        scene = _transition_scene(transition, index, source_path_id=source_path_id)
         if scene:
             scenes.append(scene)
     return scenes
@@ -620,7 +677,7 @@ def _state_path_transitions(state: dict, states_by_id: dict[str, dict]) -> list[
     return list(reversed(transitions))
 
 
-def _transition_scene(transition: dict, index: int) -> dict | None:
+def _transition_scene(transition: dict, index: int, source_path_id: str | None = None) -> dict | None:
     actions = [
         _probe_action_for_plan(action, transition, action_index)
         for action_index, action in enumerate(transition.get("actions", []), 1)
@@ -642,6 +699,7 @@ def _transition_scene(transition: dict, index: int) -> dict | None:
         success_criteria="The interaction completes and the next UI state is visible.",
         narration_hint=f"Explain what changes after {clean_label}.",
         source_transition=transition,
+        source_path_id=source_path_id,
     )
 
 
