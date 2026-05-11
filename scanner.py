@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
+import ssl
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,12 +37,18 @@ MAX_ACCESSIBILITY_DEPTH = 4
 DEFAULT_PROBE_DEPTH = 3
 DEFAULT_MAX_STATES = 16
 DEFAULT_MAX_ACTIONS_PER_STATE = 5
+DEFAULT_LLM_MODEL = "gpt-5.1"
 MAX_CANDIDATE_PATHS = 30
 MAX_OUTCOME_ITEMS = 12
+MAX_LLM_EXPANSIONS = 2
+MAX_LLM_EXPANSION_ACTIONS = 8
+MAX_LLM_EXPANSION_STATES = 10
+MAX_LLM_EXPANSION_ELEMENTS = 80
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
     "toggle": 8,
+    "llm_workflow": 24,
 }
 RISK_WORDS = {
     "account",
@@ -88,6 +98,9 @@ async def scan(
     source_max_ui_strings: int = MAX_UI_STRINGS,
     source_max_file_chars: int = MAX_FILE_CHARS,
     source_max_file_bytes: int = MAX_FILE_BYTES,
+    llm_expand: bool = False,
+    llm_model: str | None = None,
+    max_llm_expansions: int = MAX_LLM_EXPANSIONS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -101,6 +114,7 @@ async def scan(
     states: list[dict] = []
     transitions: list[dict] = []
     candidate_paths: list[dict] = []
+    llm_expansion: dict = {"status": "disabled"}
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -156,6 +170,24 @@ async def scan(
                     timeout_ms=timeout_ms,
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
+
+            if llm_expand:
+                llm_expansion = await _expand_states_with_llm(
+                    browser=browser,
+                    start_url=final_url,
+                    output_dir=output_dir,
+                    states=states,
+                    transitions=transitions,
+                    candidate_paths=candidate_paths,
+                    viewport=viewport,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    timeout_ms=timeout_ms,
+                    source_context=source_context,
+                    model=llm_model,
+                    max_expansions=max_llm_expansions,
+                )
+                candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
             await browser.close()
@@ -172,6 +204,9 @@ async def scan(
             "probe_depth": probe_depth,
             "max_states": max_states,
             "max_actions_per_state": max_actions_per_state,
+            "llm_expand": llm_expand,
+            "llm_model": llm_model,
+            "max_llm_expansions": max_llm_expansions,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -202,6 +237,7 @@ async def scan(
         "states": states,
         "transitions": transitions,
         "candidate_paths": candidate_paths,
+        "llm_expansion": llm_expansion,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -331,6 +367,152 @@ async def _explore_states(
     return transitions
 
 
+async def _expand_states_with_llm(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    candidate_paths: list[dict],
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    source_context: dict | None,
+    model: str | None,
+    max_expansions: int,
+) -> dict:
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "skipped",
+            "reason": "Missing OPENAI_API_KEY.",
+            "model": model,
+            "accepted": 0,
+            "attempted": 0,
+        }
+
+    try:
+        payload = _call_openai_workflow_expander(
+            _workflow_expansion_context(
+                start_url=start_url,
+                states=states,
+                candidate_paths=candidate_paths,
+                source_context=source_context,
+            ),
+            api_key=api_key,
+            model=model,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "model": model,
+            "error": f"{type(exc).__name__}: {exc}",
+            "accepted": 0,
+            "attempted": 0,
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    candidates, rejected = _normalize_llm_workflow_candidates(
+        payload,
+        states_by_id=states_by_id,
+        max_expansions=max_expansions,
+    )
+    signatures = {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+    accepted = 0
+    attempted = 0
+    results = []
+
+    for candidate in candidates:
+        parent_state = states_by_id.get(candidate["parent_state_id"])
+        if not parent_state:
+            continue
+
+        attempted += 1
+        transition = {
+            "from": parent_state["state_id"],
+            "to": None,
+            "candidate_id": candidate["candidate_id"],
+            "label": candidate["label"],
+            "kind": candidate["kind"],
+            "goal": candidate.get("goal"),
+            "expected_outcome": candidate.get("expected_outcome"),
+            "origin": "llm",
+            "actions": candidate["actions"],
+            "status": "pending",
+        }
+        trial = await _run_probe_candidate(
+            browser=browser,
+            start_url=start_url,
+            output_dir=output_dir,
+            viewport=viewport,
+            parent_state=parent_state,
+            candidate=candidate,
+            console_errors=console_errors,
+            page_errors=page_errors,
+            timeout_ms=timeout_ms,
+            next_index=len(states),
+        )
+
+        if trial["status"] != "success":
+            transition["status"] = trial["status"]
+            transition["error"] = trial.get("error")
+            transitions.append(transition)
+            results.append(_llm_expansion_result(candidate, transition))
+            continue
+
+        next_state = trial["state"]
+        transition["outcome_summary"] = _transition_outcome_summary(parent_state, next_state)
+        duplicate_state_id = signatures.get(next_state["signature"])
+        if duplicate_state_id:
+            transition["status"] = "duplicate"
+            transition["to"] = duplicate_state_id
+            transitions.append(transition)
+            results.append(_llm_expansion_result(candidate, transition))
+            continue
+
+        signatures[next_state["signature"]] = next_state["state_id"]
+        transition["status"] = "success"
+        transition["to"] = next_state["state_id"]
+        next_state["transition"] = transition
+        states.append(next_state)
+        states_by_id[next_state["state_id"]] = next_state
+        transitions.append(transition)
+        accepted += 1
+        results.append(_llm_expansion_result(candidate, transition))
+
+    return {
+        "status": "completed",
+        "model": model,
+        "rationale": payload.get("rationale", ""),
+        "attempted": attempted,
+        "accepted": accepted,
+        "rejected": rejected,
+        "results": results,
+    }
+
+
+def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "parent_state_id": candidate.get("parent_state_id"),
+        "label": candidate.get("label"),
+        "goal": candidate.get("goal"),
+        "status": transition.get("status"),
+        "to": transition.get("to"),
+        "error": transition.get("error"),
+    }
+
+
 async def _run_probe_candidate(
     browser,
     start_url: str,
@@ -415,6 +597,345 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
             return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     return {"status": "success"}
+
+
+def _call_openai_workflow_expander(context: dict, api_key: str, model: str) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_workflow_expander_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(context, indent=2),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_workflow_expansion",
+                "strict": True,
+                "schema": _llm_workflow_expansion_schema(),
+            }
+        },
+        "max_output_tokens": 3_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60, context=_https_context()) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
+def _https_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def _extract_openai_output_text(body: dict) -> str:
+    if body.get("output_text"):
+        return body["output_text"]
+
+    chunks = []
+    for item in body.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                chunks.append(content["text"])
+    return "".join(chunks)
+
+
+def _llm_workflow_expander_prompt() -> str:
+    return (
+        "You are Folio's workflow expansion strategist. Propose a small number of safe, bounded browser workflows "
+        "that demonstrate core app functionality missing from the current scanner-tested candidate paths. Use only "
+        "state_id values and selectors provided in the context. Prefer main content workflows that create, calculate, "
+        "filter, save, search, preview, or otherwise produce visible product outcomes. Avoid feedback forms, generic "
+        "site search, legal/account/navigation/footer/header actions unless those are the actual product. Return only "
+        "JSON matching the schema. Folio will validate every proposed action in Playwright before using it."
+    )
+
+
+def _workflow_expansion_context(
+    start_url: str,
+    states: list[dict],
+    candidate_paths: list[dict],
+    source_context: dict | None,
+) -> dict:
+    return {
+        "start_url": start_url,
+        "source_context": _source_context_for_expander(source_context),
+        "candidate_paths": [
+            {
+                "path_id": path.get("path_id"),
+                "score": path.get("score"),
+                "labels": path.get("labels", []),
+                "kinds": path.get("kinds", []),
+                "quality_tags": path.get("quality_tags", []),
+                "final_state_id": path.get("final_state_id"),
+                "final_url": path.get("final_url"),
+                "transition_outcomes": [
+                    {
+                        "label": transition.get("label"),
+                        "kind": transition.get("kind"),
+                        "outcome_summary": transition.get("outcome_summary"),
+                    }
+                    for transition in path.get("transitions", [])
+                ],
+            }
+            for path in candidate_paths[:MAX_CANDIDATE_PATHS]
+        ],
+        "states": [
+            _state_for_expander(state)
+            for state in states[:MAX_LLM_EXPANSION_STATES]
+        ],
+        "supported_actions": ["observe", "click", "fill", "press"],
+    }
+
+
+def _source_context_for_expander(source_context: dict | None) -> dict | None:
+    if not source_context:
+        return None
+
+    return {
+        "summary": source_context.get("summary", {}),
+        "framework_hints": source_context.get("framework_hints", []),
+        "routes": source_context.get("routes", [])[:30],
+        "components": source_context.get("components", [])[:40],
+        "ui_strings": source_context.get("ui_strings", [])[:40],
+    }
+
+
+def _state_for_expander(state: dict) -> dict:
+    dom = state.get("dom", {})
+    return {
+        "state_id": state.get("state_id"),
+        "title": state.get("title"),
+        "url": state.get("url"),
+        "depth": state.get("depth"),
+        "parent_state_id": state.get("parent_state_id"),
+        "replay_actions": state.get("replay_actions", []),
+        "text_blocks": dom.get("text_blocks", [])[:30],
+        "headings": dom.get("headings", [])[:12],
+        "interactive": [
+            _element_for_expander(element, index)
+            for index, element in enumerate(dom.get("interactive", [])[:MAX_LLM_EXPANSION_ELEMENTS], 1)
+        ],
+        "forms": [
+            {
+                "selectors": form.get("selectors", [])[:2],
+                "fields": [
+                    _element_for_expander(field, field_index)
+                    for field_index, field in enumerate(form.get("fields", [])[:30], 1)
+                ],
+            }
+            for form in dom.get("forms", [])[:8]
+        ],
+    }
+
+
+def _element_for_expander(element: dict, index: int) -> dict:
+    return {
+        "index": index,
+        "name": _element_name(element),
+        "tag": element.get("tag"),
+        "type": element.get("type"),
+        "role": element.get("role"),
+        "text": element.get("text"),
+        "href": element.get("href"),
+        "selectors": element.get("selectors", []),
+        "attributes": element.get("attributes", {}),
+        "bounds": element.get("bounds", {}),
+    }
+
+
+def _llm_workflow_expansion_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "workflow_candidates", "rejected_goals"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "workflow_candidates": {
+                "type": "array",
+                "maxItems": MAX_LLM_EXPANSIONS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["parent_state_id", "label", "goal", "expected_outcome", "actions"],
+                    "properties": {
+                        "parent_state_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "expected_outcome": {"type": "string"},
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_LLM_EXPANSION_ACTIONS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press"]},
+                                    "description": {"type": "string"},
+                                    "selector": {"type": ["string", "null"]},
+                                    "value": {"type": ["string", "null"]},
+                                    "key": {"type": ["string", "null"]},
+                                    "allow_hidden": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "rejected_goals": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string"},
+            },
+        },
+    }
+
+
+def _normalize_llm_workflow_candidates(
+    payload: dict,
+    states_by_id: dict[str, dict],
+    max_expansions: int,
+) -> tuple[list[dict], list[dict]]:
+    candidates = []
+    rejected = []
+    for index, raw_candidate in enumerate(payload.get("workflow_candidates", []), 1):
+        if len(candidates) >= max(0, max_expansions):
+            break
+
+        parent_state_id = raw_candidate.get("parent_state_id")
+        parent_state = states_by_id.get(parent_state_id)
+        if not parent_state:
+            rejected.append(_rejected_llm_candidate(raw_candidate, "Unknown parent_state_id."))
+            continue
+
+        actions, errors = _normalize_llm_workflow_actions(raw_candidate, parent_state)
+        if errors:
+            rejected.append(_rejected_llm_candidate(raw_candidate, "; ".join(errors)))
+            continue
+        if not _is_meaningful_workflow(actions):
+            rejected.append(_rejected_llm_candidate(raw_candidate, "Workflow must include a fill action and a click or press action."))
+            continue
+
+        label = _clean_label(raw_candidate.get("label") or f"LLM workflow {index}")
+        candidates.append(
+            {
+                "candidate_id": f"llm-workflow:{parent_state_id}:{_slug(label)}",
+                "parent_state_id": parent_state_id,
+                "kind": "llm_workflow",
+                "label": label,
+                "goal": _clean_label(raw_candidate.get("goal") or label),
+                "expected_outcome": _clean_label(raw_candidate.get("expected_outcome") or ""),
+                "priority": 5,
+                "bounds": {},
+                "actions": actions,
+            }
+        )
+
+    return candidates, rejected
+
+
+def _normalize_llm_workflow_actions(raw_candidate: dict, parent_state: dict) -> tuple[list[dict], list[str]]:
+    selector_map = _selectors_for_state(parent_state)
+    actions = []
+    errors = []
+    for index, raw_action in enumerate(raw_candidate.get("actions", [])[:MAX_LLM_EXPANSION_ACTIONS], 1):
+        action_type = raw_action.get("type")
+        if action_type not in {"observe", "click", "fill", "press"}:
+            errors.append(f"Unsupported action type at {index}: {action_type}")
+            continue
+
+        action = {
+            "type": action_type,
+            "description": _clean_label(raw_action.get("description") or f"{action_type} action."),
+            "origin": "llm",
+        }
+        selector = raw_action.get("selector")
+        if action_type in {"click", "fill", "press"}:
+            if not selector or selector not in selector_map:
+                errors.append(f"Selector is not available in parent state at {index}: {selector}")
+                continue
+            element = selector_map[selector]
+            if action_type == "click" and _click_action_is_risky(element, parent_state):
+                errors.append(f"Risky click selector at {index}: {selector}")
+                continue
+            action["selector"] = selector
+        if action_type == "fill":
+            value = str(raw_action.get("value") or "").strip()
+            if not value:
+                errors.append(f"Fill action missing value at {index}: {selector}")
+                continue
+            action["value"] = value[:120]
+        if action_type == "press":
+            action["key"] = str(raw_action.get("key") or "Enter")[:40]
+        if raw_action.get("allow_hidden"):
+            action["allow_hidden"] = True
+        actions.append(action)
+
+    return actions, errors
+
+
+def _selectors_for_state(state: dict) -> dict[str, dict]:
+    selector_map = {}
+    for element in state.get("dom", {}).get("interactive", []):
+        for selector in element.get("selectors", []) or []:
+            selector_map[selector] = element
+    return selector_map
+
+
+def _click_action_is_risky(element: dict, state: dict) -> bool:
+    label = _element_name(element).lower()
+    if _has_risk_word(label):
+        return True
+    href = element.get("href")
+    state_url = state.get("url")
+    return bool(href and state_url and not _is_same_origin_url(href, state_url))
+
+
+def _is_meaningful_workflow(actions: list[dict]) -> bool:
+    action_types = {action.get("type") for action in actions}
+    return "fill" in action_types and bool({"click", "press"} & action_types)
+
+
+def _rejected_llm_candidate(candidate: dict, reason: str) -> dict:
+    return {
+        "parent_state_id": candidate.get("parent_state_id"),
+        "label": candidate.get("label"),
+        "reason": reason,
+    }
+
+
+def _clean_label(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 async def _wait_for_settle(page) -> None:
@@ -538,6 +1059,9 @@ def _path_transition(transition: dict) -> dict:
         "candidate_id": transition.get("candidate_id"),
         "label": transition.get("label"),
         "kind": transition.get("kind"),
+        "goal": transition.get("goal"),
+        "expected_outcome": transition.get("expected_outcome"),
+        "origin": transition.get("origin"),
         "actions": transition.get("actions", []),
         "status": transition.get("status"),
         "outcome_summary": transition.get("outcome_summary"),
@@ -744,6 +1268,8 @@ def _candidate_path_quality_tags(transitions: list[dict]) -> list[str]:
         tags.append("submits_input")
     if "toggle" in kind_set:
         tags.append("changes_state")
+    if "llm_workflow" in kind_set:
+        tags.append("llm_guided_workflow")
     if {"input_submit", "toggle"}.issubset(kind_set):
         tags.append("creates_then_mutates")
     if kinds and kinds[-1] in STATE_CHANGING_KIND_BONUSES:
@@ -912,9 +1438,11 @@ def _state_signature(url: str, dom: dict) -> str:
             "tag": element.get("tag"),
             "type": element.get("type"),
             "role": element.get("role"),
+            "text": element.get("text"),
             "selectors": element.get("selectors", [])[:2],
             "checked": element.get("attributes", {}).get("checked"),
             "selected": element.get("attributes", {}).get("selected"),
+            "disabled": element.get("attributes", {}).get("disabled"),
             "expanded": element.get("attributes", {}).get("aria_expanded"),
         }
         for element in dom.get("interactive", [])[:50]

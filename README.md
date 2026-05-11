@@ -70,6 +70,12 @@ When probes are enabled, `scan.json` also includes `candidate_paths`: scored, re
 
 Successful probe transitions include `outcome_summary` with URL, visible text, control, and control-state changes. These summaries help planners explain why a path is useful instead of relying only on selectors.
 
+Use `--llm-expand` when the initial probe graph finds useful pages but misses the core workflow. Folio asks the LLM for bounded workflow candidates using selectors from discovered states, then validates every proposed action in Playwright before adding it to `candidate_paths`.
+
+```bash
+python main.py scan https://example.com --llm-expand --max-llm-expansions 2
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash

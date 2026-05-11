@@ -5,7 +5,7 @@ import argparse
 from planner import write_plan
 from recorder import run_record
 from renderer import render
-from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, run_scan
+from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, MAX_LLM_EXPANSIONS, run_scan
 from source_context import (
     MAX_COMPONENTS,
     MAX_FILE_BYTES,
@@ -55,6 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-probes",
         action="store_true",
         help="capture only the initial page state",
+    )
+    scan_parser.add_argument(
+        "--llm-expand",
+        action="store_true",
+        help="ask an LLM for additional workflow candidates and validate them with Playwright",
+    )
+    scan_parser.add_argument("--llm-model", help="OpenAI model for --llm-expand")
+    scan_parser.add_argument(
+        "--max-llm-expansions",
+        default=MAX_LLM_EXPANSIONS,
+        type=int,
+        help="maximum LLM-proposed workflow candidates to validate",
     )
     scan_parser.add_argument(
         "--source-root",
@@ -188,6 +200,9 @@ def handle_scan(args: argparse.Namespace) -> int:
         source_max_ui_strings=args.source_max_ui_strings,
         source_max_file_chars=args.source_max_file_chars,
         source_max_file_bytes=args.source_max_file_bytes,
+        llm_expand=args.llm_expand,
+        llm_model=args.llm_model,
+        max_llm_expansions=args.max_llm_expansions,
     )
 
     dom = result["dom"]
@@ -199,6 +214,13 @@ def handle_scan(args: argparse.Namespace) -> int:
     print(f"States: {len(result.get('states', []))}")
     print(f"Transitions: {len(result.get('transitions', []))}")
     print(f"Candidate paths: {len(result.get('candidate_paths', []))}")
+    llm_expansion = result.get("llm_expansion", {})
+    if llm_expansion.get("status") != "disabled":
+        print(
+            "LLM expansion: "
+            f"{llm_expansion.get('status')} "
+            f"({llm_expansion.get('accepted', 0)}/{llm_expansion.get('attempted', 0)} accepted)"
+        )
     source_context = result.get("source_context")
     if source_context:
         summary = source_context.get("summary", {})
