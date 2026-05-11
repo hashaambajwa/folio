@@ -162,12 +162,25 @@ def _build_llm_plan(
 
     try:
         llm_payload = _call_openai_planner(scan, api_key=api_key, model=model)
-        scenes = _normalize_llm_scenes(llm_payload)
+        selected_path = _selected_candidate_path(scan, llm_payload.get("selected_path_id"))
+        if selected_path:
+            scenes = _llm_selected_path_scenes(scan, selected_path, llm_payload)
+        else:
+            scenes = _normalize_llm_scenes(llm_payload)
         if not scenes:
             raise ValueError("LLM response did not include usable scenes.")
 
         plan_path = _default_plan_path(scan, scan_path, output_path)
         title = _page_title(scan.get("page", {}), scan.get("dom", {}))
+        notes = [
+            "LLM-generated plan using scanner DOM, source context, and replayable candidate paths.",
+            "Review selectors before using on high-stakes demos.",
+        ]
+        if selected_path:
+            notes.insert(1, "LLM selected a scanner-tested candidate path; Folio used canonical replay actions from that path.")
+        elif llm_payload.get("selected_path_id"):
+            notes.insert(1, "LLM selected a candidate path id that was not available; Folio used normalized LLM scenes instead.")
+
         return _assemble_plan(
             scan=scan,
             scan_path=scan_path,
@@ -181,11 +194,10 @@ def _build_llm_plan(
                 "confidence": "llm",
                 "needs_review": True,
                 "fallback_used": False,
-                "notes": [
-                    "LLM-generated plan using scanner DOM, source context, and replayable candidate paths.",
-                    "Review selectors before using on high-stakes demos.",
-                ],
+                "notes": notes,
                 "selected_path_id": llm_payload.get("selected_path_id"),
+                "selected_path_valid": bool(selected_path),
+                "scene_source": "selected_candidate_path" if selected_path else "llm_scenes",
                 "rationale": llm_payload.get("rationale", ""),
             },
         )
@@ -306,7 +318,8 @@ def _llm_system_prompt() -> str:
         "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
         "Use only selectors present in the provided scan context for click, fill, and press actions. "
         "Use discovered states and transitions to understand UI that appears after interaction. "
-        "Prefer selecting a replayable candidate_paths entry and copying its actions instead of inventing actions. "
+        "Prefer selecting the replayable candidate_paths entry that best demonstrates the product value. "
+        "When selected_path_id is set, Folio will use the scanner-tested actions from that path; use scenes to provide clear demo wording. "
         "Use source_context when provided to infer the app's intended routes, features, and product language. "
         "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
     )
@@ -361,6 +374,95 @@ def _candidate_path_for_llm(path: dict) -> dict:
         "transitions": path.get("transitions", []),
         "final_state_summary": path.get("final_state_summary", {}),
     }
+
+
+def _selected_candidate_path(scan: dict, path_id: str | None) -> dict | None:
+    if not path_id:
+        return None
+
+    for path in scan.get("candidate_paths", []):
+        if path.get("path_id") == path_id and path.get("transitions"):
+            return path
+    return None
+
+
+def _llm_selected_path_scenes(scan: dict, selected_path: dict, payload: dict) -> list[dict]:
+    page = scan.get("page", {})
+    title = _page_title(page, scan.get("dom", {}))
+    path_id = selected_path.get("path_id")
+    transition_scenes = _transition_scenes_for_path(
+        selected_path.get("transitions", []),
+        source_path_id=path_id,
+    )
+    if not transition_scenes:
+        return []
+
+    scenes = [
+        _apply_scene_copy(
+            _intro_scene(title, page.get("final_url")),
+            _first_scene_copy(payload, {"intro"}),
+        )
+    ]
+
+    interaction_copies = _scene_copies(payload, {"interaction", "overview"})
+    for scene, copy in zip(transition_scenes, interaction_copies):
+        scenes.append(_apply_scene_copy(scene, copy))
+    if len(interaction_copies) < len(transition_scenes):
+        scenes.extend(transition_scenes[len(interaction_copies):])
+
+    scenes.append(
+        _apply_scene_copy(
+            _outro_scene(title),
+            _first_scene_copy(payload, {"outro"}),
+        )
+    )
+    return scenes
+
+
+def _first_scene_copy(payload: dict, scene_types: set[str]) -> dict | None:
+    copies = _scene_copies(payload, scene_types)
+    return copies[0] if copies else None
+
+
+def _scene_copies(payload: dict, scene_types: set[str]) -> list[dict]:
+    copies = []
+    for scene in payload.get("scenes", []):
+        if scene.get("type") not in scene_types:
+            continue
+        copy = _scene_copy(scene)
+        if copy:
+            copies.append(copy)
+    return copies
+
+
+def _scene_copy(scene: dict) -> dict:
+    copy = {}
+    for key in ("title", "goal", "success_criteria", "narration_hint"):
+        value = scene.get(key)
+        if isinstance(value, str) and value.strip():
+            copy[key] = value.strip()
+    if scene.get("duration_seconds"):
+        copy["duration_seconds"] = _bounded_duration(scene.get("duration_seconds"))
+    return copy
+
+
+def _apply_scene_copy(scene: dict, copy: dict | None) -> dict:
+    if not copy:
+        return scene
+
+    merged = dict(scene)
+    for key in ("title", "goal", "duration_seconds", "success_criteria", "narration_hint"):
+        if key in copy:
+            merged[key] = copy[key]
+    return merged
+
+
+def _bounded_duration(value: object) -> int:
+    try:
+        duration = int(value)
+    except (TypeError, ValueError):
+        return 5
+    return max(2, min(12, duration))
 
 
 def _source_context_for_llm(source_context: dict | None) -> dict | None:

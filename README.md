@@ -66,7 +66,7 @@ python main.py scan https://example.com --probe-depth 3 --max-states 16 --max-ac
 
 Use `--no-probes` when you only want the first loaded page state.
 
-When probes are enabled, `scan.json` also includes `candidate_paths`: scored, replayable workflows assembled from the discovered state graph. Planners should prefer these paths because every action in them has already been exercised by Playwright.
+When probes are enabled, `scan.json` also includes `candidate_paths`: scored, replayable workflows assembled from the discovered state graph. Planners should prefer these paths because every action in them has already been exercised by Playwright. In LLM mode, a valid `selected_path_id` causes Folio to use the scanner-tested actions from that path while applying the LLM's wording to the plan.
 
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 

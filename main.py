@@ -252,6 +252,8 @@ def handle_plan(args: argparse.Namespace) -> int:
         print(f"Model: {plan['planner']['model']}")
     if plan["planner"].get("fallback_used"):
         print(f"Fallback: {plan['planner'].get('error')}")
+    if plan["planner"].get("selected_path_id"):
+        print(f"Selected path: {plan['planner']['selected_path_id']}")
     print(f"Plan JSON: {plan['artifacts']['plan_json']}")
     print(f"Scenes: {len(scenes)}")
     for scene in scenes:
