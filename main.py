@@ -276,9 +276,20 @@ def handle_plan(args: argparse.Namespace) -> int:
         print(f"Fallback: {plan['planner'].get('error')}")
     if plan["planner"].get("strategy"):
         print(f"Strategy: {plan['planner']['strategy']}")
+    if plan["planner"].get("selected_path_ids"):
+        print(f"Selected paths: {len(plan['planner']['selected_path_ids'])}")
     if plan["planner"].get("selected_path_id"):
         print(f"Selected path: {plan['planner']['selected_path_id']}")
+    coverage = plan["planner"].get("coverage", {})
+    if coverage:
+        print(
+            "Coverage: "
+            f"{coverage.get('status')} "
+            f"({coverage.get('selected_path_count', 0)}/{coverage.get('candidate_path_count', 0)} paths selected)"
+        )
     missing_workflows = plan["planner"].get("path_ranking", {}).get("missing_workflows", [])
+    if not missing_workflows:
+        missing_workflows = coverage.get("missing_workflows", [])
     if missing_workflows:
         print(f"Missing workflows: {len(missing_workflows)}")
     print(f"Plan JSON: {plan['artifacts']['plan_json']}")

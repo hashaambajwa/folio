@@ -15,9 +15,30 @@ PLAN_VERSION = "0.1"
 DEFAULT_LLM_MODEL = "gpt-5.1"
 MAX_BUTTON_SCENES = 3
 MAX_TRANSITION_SCENES = 5
-MAX_LLM_CANDIDATE_PATHS = 12
+MAX_LLM_CANDIDATE_PATHS = 24
 MAX_LLM_TEXT_BLOCKS = 40
 MAX_LLM_INTERACTIVE_ELEMENTS = 60
+MIN_LLM_COVERAGE_SCORE = 0.65
+MIN_LLM_PRODUCT_WORKFLOW_SCORE = 0.45
+GENERIC_FEATURE_LABELS = {
+    "about",
+    "calculators",
+    "home",
+    "rapidtables",
+    "search",
+    "send feedback",
+    "submit feedback",
+}
+GENERIC_UTILITY_TERMS = (
+    "about",
+    "contact",
+    "feedback",
+    "message",
+    "recommend",
+    "search",
+    "site",
+    "support",
+)
 OUTCOME_FOCUS_TERMS = (
     "answer",
     "calculation",
@@ -73,21 +94,29 @@ def _build_heuristic_plan(
     page = scan.get("page", {})
     dom = scan.get("dom", {})
     title = _page_title(page, dom)
-    scenes = _build_heuristic_scenes(scan)
+    coverage = _build_coverage_plan(scan)
+    scenes = _coverage_scenes(scan, coverage) or _build_heuristic_scenes(scan)
     planner = {
         "mode": "heuristic",
         "confidence": "fallback",
         "needs_review": True,
+        "strategy": "coverage_heuristic" if coverage.get("selected_path_ids") else "heuristic",
+        "coverage": coverage,
         "notes": [
-            "Heuristic plan generated without app-specific reasoning.",
+            "Heuristic coverage plan generated from scanner-tested candidate paths.",
             "LLM planner should replace or refine these scenes before production use.",
         ],
     }
     if planner_overrides:
         planner.update(planner_overrides)
-    selected_path = _best_candidate_path(scan)
-    if selected_path and "selected_path_id" not in planner:
-        planner["selected_path_id"] = selected_path.get("path_id")
+    selected_path_ids = coverage.get("selected_path_ids", [])
+    if selected_path_ids:
+        planner["selected_path_ids"] = selected_path_ids
+        planner.setdefault("selected_path_id", selected_path_ids[0])
+    else:
+        selected_path = _best_candidate_path(scan)
+        if selected_path and "selected_path_id" not in planner:
+            planner["selected_path_id"] = selected_path.get("path_id")
 
     return _assemble_plan(
         scan=scan,
@@ -177,18 +206,13 @@ def _build_llm_plan(
 
     try:
         ranker_payload = _call_openai_path_ranker(scan, api_key=api_key, model=model)
-        ranked_path_id = _ranker_selected_path_id(ranker_payload)
-        selected_path = _selected_candidate_path(scan, ranked_path_id)
-        if selected_path:
+        coverage = _build_coverage_plan(scan, ranker_payload)
+        if coverage.get("selected_path_ids"):
             plan_path = _default_plan_path(scan, scan_path, output_path)
             title = _page_title(scan.get("page", {}), scan.get("dom", {}))
-            scenes = _llm_selected_path_scenes(
-                scan,
-                selected_path,
-                _ranker_scene_payload(scan, selected_path, ranker_payload),
-            )
+            scenes = _coverage_scenes(scan, coverage, ranker_payload)
             if not scenes:
-                raise ValueError("LLM path ranker selected a path without usable scenes.")
+                raise ValueError("LLM coverage planner selected paths without usable scenes.")
 
             return _assemble_plan(
                 scan=scan,
@@ -203,17 +227,19 @@ def _build_llm_plan(
                     "confidence": "llm",
                     "needs_review": True,
                     "fallback_used": False,
-                    "strategy": "candidate_path_rerank",
+                    "strategy": "coverage",
                     "notes": [
-                        "LLM ranked scanner-tested candidate paths and selected the best available demo workflow.",
-                        "Folio used canonical replay actions from the selected path.",
-                        "Review missing_workflows to see whether deeper exploration is needed.",
+                        "LLM ranked scanner-tested candidate paths; Folio selected every validated workflow needed for feature coverage.",
+                        "Folio used canonical replay actions from selected paths.",
+                        "Review coverage.uncovered_features and coverage.missing_workflows to drive deeper exploration.",
                     ],
-                    "selected_path_id": selected_path.get("path_id"),
+                    "selected_path_id": coverage["selected_path_ids"][0],
+                    "selected_path_ids": coverage["selected_path_ids"],
                     "selected_path_valid": True,
-                    "scene_source": "selected_candidate_path",
+                    "scene_source": "coverage_candidate_paths",
                     "rationale": ranker_payload.get("rationale", ""),
                     "path_ranking": _path_ranking_for_plan(ranker_payload),
+                    "coverage": coverage,
                 },
             )
 
@@ -606,10 +632,268 @@ def _outcome_narration_hint(transition: dict) -> str:
 def _path_ranking_for_plan(payload: dict) -> dict:
     return {
         "rationale": payload.get("rationale", ""),
-        "ranked_paths": payload.get("ranked_paths", [])[:8],
-        "rejected_paths": payload.get("rejected_paths", [])[:12],
+        "ranked_paths": payload.get("ranked_paths", [])[:MAX_LLM_CANDIDATE_PATHS],
+        "rejected_paths": payload.get("rejected_paths", [])[:MAX_LLM_CANDIDATE_PATHS],
         "missing_workflows": payload.get("missing_workflows", [])[:8],
     }
+
+
+def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict:
+    paths = [path for path in scan.get("candidate_paths", []) if path.get("transitions")]
+    rank_map = {
+        item.get("path_id"): item
+        for item in (ranker_payload or {}).get("ranked_paths", [])
+        if item.get("path_id")
+    }
+    rejected_map = {
+        item.get("path_id"): item.get("reason", "")
+        for item in (ranker_payload or {}).get("rejected_paths", [])
+        if item.get("path_id")
+    }
+    selected_path_id = _ranker_selected_path_id(ranker_payload or {})
+
+    path_items = [
+        _coverage_path_item(path, rank_map.get(path.get("path_id")), rejected_map.get(path.get("path_id")))
+        for path in paths
+    ]
+    path_items = [item for item in path_items if item]
+    path_items.sort(key=lambda item: (item["demo_value_score"], item["heuristic_score"]), reverse=True)
+
+    covered_features = []
+    uncovered_features_by_id = {}
+    selected_path_ids = []
+    for item in path_items:
+        force_selected = selected_path_id and item["path_id"] == selected_path_id
+        if _coverage_item_is_selected(item, force_selected=force_selected):
+            selected_path_ids.append(item["path_id"])
+            covered_features.append(
+                {
+                    "feature_id": item["feature_id"],
+                    "title": item["feature_title"],
+                    "path_id": item["path_id"],
+                    "demo_value_score": item["demo_value_score"],
+                    "reason": item["reason"],
+                    "quality_tags": item["quality_tags"],
+                    "workflow_kind": item["workflow_kind"],
+                }
+            )
+            continue
+
+        if _coverage_item_is_uncovered(item):
+            uncovered = uncovered_features_by_id.setdefault(
+                item["feature_id"],
+                {
+                    "feature_id": item["feature_id"],
+                    "title": item["feature_title"],
+                    "candidate_path_ids": [],
+                    "reason": item["rejected_reason"] or "No validated product workflow selected for this feature yet.",
+                },
+            )
+            uncovered["candidate_path_ids"].append(item["path_id"])
+
+    covered_feature_ids = {feature["feature_id"] for feature in covered_features}
+    uncovered_features = [
+        feature
+        for feature_id, feature in uncovered_features_by_id.items()
+        if feature_id not in covered_feature_ids
+    ]
+
+    missing_workflows = (ranker_payload or {}).get("missing_workflows", [])[:8]
+    status = "complete" if selected_path_ids and not uncovered_features and not missing_workflows else "partial"
+    if not selected_path_ids:
+        status = "none"
+
+    return {
+        "status": status,
+        "coverage_confidence": "llm" if ranker_payload else "heuristic",
+        "selected_path_ids": selected_path_ids,
+        "covered_features": covered_features,
+        "uncovered_features": uncovered_features,
+        "missing_workflows": missing_workflows,
+        "rejected_paths": [
+            {"path_id": path_id, "reason": reason}
+            for path_id, reason in rejected_map.items()
+        ],
+        "candidate_path_count": len(paths),
+        "selected_path_count": len(selected_path_ids),
+    }
+
+
+def _coverage_path_item(path: dict, rank_item: dict | None, rejected_reason: str | None) -> dict:
+    path_id = path.get("path_id")
+    feature_title = _path_feature_title(path)
+    heuristic_score = int(path.get("score") or 0)
+    demo_value_score = _coverage_demo_value(path, rank_item)
+    reason = (rank_item or {}).get("reason") or "; ".join(path.get("selection_reasons", [])[:2])
+    quality_tags = path.get("quality_tags", [])
+    workflow_kind = _path_workflow_kind(path)
+    return {
+        "path_id": path_id,
+        "feature_id": _slug(feature_title),
+        "feature_title": feature_title,
+        "heuristic_score": heuristic_score,
+        "demo_value_score": demo_value_score,
+        "reason": reason,
+        "rejected_reason": rejected_reason,
+        "quality_tags": quality_tags,
+        "workflow_kind": workflow_kind,
+    }
+
+
+def _coverage_demo_value(path: dict, rank_item: dict | None) -> float:
+    if rank_item and isinstance(rank_item.get("demo_value_score"), (int, float)):
+        return max(0.0, min(1.0, float(rank_item["demo_value_score"])))
+
+    score = int(path.get("score") or 0)
+    if _path_has_product_workflow(path):
+        return max(0.55, min(0.9, score / 50))
+    return min(0.45, score / 80)
+
+
+def _coverage_item_is_selected(item: dict, force_selected: bool = False) -> bool:
+    if force_selected:
+        return True
+    if item["rejected_reason"]:
+        return False
+    if item["demo_value_score"] >= MIN_LLM_COVERAGE_SCORE:
+        return True
+    return item["demo_value_score"] >= MIN_LLM_PRODUCT_WORKFLOW_SCORE and item["workflow_kind"] == "product_workflow"
+
+
+def _coverage_item_is_uncovered(item: dict) -> bool:
+    if item["workflow_kind"] == "product_workflow":
+        return True
+    if item["rejected_reason"]:
+        return False
+    return item["demo_value_score"] >= MIN_LLM_COVERAGE_SCORE
+
+
+def _path_has_product_workflow(path: dict) -> bool:
+    quality_tags = set(path.get("quality_tags", []))
+    kinds = set(path.get("kinds", []))
+    action_types = set(path.get("action_types", []))
+    if "llm_guided_workflow" in quality_tags or "llm_workflow" in kinds:
+        return True
+    if _path_looks_generic_utility(path):
+        return False
+    if "creates_then_mutates" in quality_tags:
+        return True
+    if bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types):
+        return True
+    return False
+
+
+def _path_looks_generic_utility(path: dict) -> bool:
+    text = " ".join(
+        [
+            *[str(label or "") for label in path.get("labels", [])],
+            *[str(action.get("description") or "") for action in path.get("replay_actions", [])],
+            str(path.get("final_state_summary", {}).get("title") or ""),
+        ]
+    ).lower()
+    return any(term in text for term in GENERIC_UTILITY_TERMS)
+
+
+def _path_workflow_kind(path: dict) -> str:
+    if _path_has_product_workflow(path):
+        return "product_workflow"
+    if path.get("same_origin") and path.get("final_url"):
+        return "navigation"
+    return "utility"
+
+
+def _path_feature_title(path: dict) -> str:
+    labels = [_clean_transition_label(label) for label in path.get("labels", []) if label]
+    for label in labels:
+        normalized = label.lower()
+        if normalized in GENERIC_FEATURE_LABELS or normalized.startswith("submit "):
+            continue
+        return label
+
+    final_summary = path.get("final_state_summary", {})
+    title = _clean_transition_label(final_summary.get("title") or "")
+    if title:
+        return title
+    if labels:
+        return labels[0]
+    return path.get("path_id") or "workflow"
+
+
+def _coverage_scenes(scan: dict, coverage: dict, ranker_payload: dict | None = None) -> list[dict]:
+    selected_path_ids = coverage.get("selected_path_ids", [])
+    if not selected_path_ids:
+        return []
+
+    paths_by_id = {
+        path.get("path_id"): path
+        for path in scan.get("candidate_paths", [])
+        if path.get("path_id")
+    }
+    title = _page_title(scan.get("page", {}), scan.get("dom", {}))
+    start_url = _recording_start_url(scan)
+    scenes = [_intro_scene(title, scan.get("page", {}).get("final_url"))]
+
+    for index, path_id in enumerate(selected_path_ids, 1):
+        path = paths_by_id.get(path_id)
+        if not path:
+            continue
+
+        if index > 1:
+            reset_url = _path_start_url(path, start_url)
+            if reset_url:
+                scenes.append(_workflow_reset_scene(path, index, reset_url))
+
+        path_scenes = _transition_scenes_for_path(
+            path.get("transitions", []),
+            source_path_id=path_id,
+            max_transitions=None,
+        )
+        reason = _ranked_path_reason(ranker_payload or {}, path_id)
+        for scene in path_scenes:
+            scene["scene_id"] = f"workflow-{index}-{scene['scene_id']}"
+            scene["workflow_index"] = index
+            scene["feature_title"] = _path_feature_title(path)
+            if reason:
+                scene["goal"] = reason
+                scene["narration_hint"] = reason
+        scenes.extend(path_scenes)
+
+    scenes.append(_outro_scene(title))
+    return scenes
+
+
+def _workflow_reset_scene(path: dict, index: int, url: str | None) -> dict:
+    feature_title = _path_feature_title(path)
+    return _scene(
+        scene_id=f"workflow-{index}-reset",
+        title=f"Start {feature_title}",
+        goal=f"Return to a known app state before demonstrating {feature_title}.",
+        scene_type="overview",
+        duration_seconds=2,
+        actions=[
+            {
+                "action_id": f"navigate-workflow-{index}",
+                "type": "navigate",
+                "url": url,
+                "description": f"Navigate to the starting state for {feature_title}.",
+            }
+        ],
+        success_criteria="The next workflow starts from a stable app state.",
+        narration_hint=f"Move to the next feature area: {feature_title}.",
+        source_path_id=path.get("path_id"),
+    )
+
+
+def _recording_start_url(scan: dict) -> str | None:
+    return scan.get("page", {}).get("final_url") or scan.get("input", {}).get("url")
+
+
+def _path_start_url(path: dict, fallback_url: str | None) -> str | None:
+    for transition in path.get("transitions", []):
+        before_url = (transition.get("outcome_summary") or {}).get("before_url")
+        if before_url:
+            return before_url
+    return fallback_url
 
 
 def _llm_selected_path_scenes(scan: dict, selected_path: dict, payload: dict) -> list[dict]:
@@ -821,7 +1105,7 @@ def _llm_path_rank_schema() -> dict:
             "selected_path_id": {"type": ["string", "null"]},
             "ranked_paths": {
                 "type": "array",
-                "maxItems": 8,
+                "maxItems": MAX_LLM_CANDIDATE_PATHS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -835,7 +1119,7 @@ def _llm_path_rank_schema() -> dict:
             },
             "rejected_paths": {
                 "type": "array",
-                "maxItems": 12,
+                "maxItems": MAX_LLM_CANDIDATE_PATHS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -991,9 +1275,14 @@ def _best_candidate_path(scan: dict) -> dict | None:
     )
 
 
-def _transition_scenes_for_path(transitions: list[dict], source_path_id: str | None = None) -> list[dict]:
+def _transition_scenes_for_path(
+    transitions: list[dict],
+    source_path_id: str | None = None,
+    max_transitions: int | None = MAX_TRANSITION_SCENES,
+) -> list[dict]:
     scenes = []
-    for index, transition in enumerate(transitions[:MAX_TRANSITION_SCENES], 1):
+    selected_transitions = transitions if max_transitions is None else transitions[:max_transitions]
+    for index, transition in enumerate(selected_transitions, 1):
         scene = _transition_scene(transition, index, source_path_id=source_path_id)
         if scene:
             scenes.append(scene)

@@ -66,7 +66,7 @@ python main.py scan https://example.com --probe-depth 3 --max-states 16 --max-ac
 
 Use `--no-probes` when you only want the first loaded page state.
 
-When probes are enabled, `scan.json` also includes `candidate_paths`: scored, replayable workflows assembled from the discovered state graph. Paths that create or mutate state are ranked above passive navigation because they usually make stronger demos. In LLM mode, a valid `selected_path_id` causes Folio to use the scanner-tested actions from that path while applying the LLM's wording to the plan.
+When probes are enabled, `scan.json` also includes `candidate_paths`: scored, replayable workflows assembled from the discovered state graph. Paths that create or mutate state are ranked above passive navigation because they usually make stronger demos. Plans include `planner.coverage`, which tracks selected validated workflows, covered feature areas, uncovered feature areas, and missing workflows.
 
 Successful probe transitions include `outcome_summary` with URL, visible text, control, and control-state changes. These summaries help planners explain why a path is useful instead of relying only on selectors.
 
@@ -109,6 +109,6 @@ export OPENAI_API_KEY=...
 python main.py plan outputs/smoke/scan.json --mode llm
 ```
 
-In LLM mode, Folio first asks the model to rank scanner-tested `candidate_paths` by demo value. If the model selects a valid path, the final plan uses that path's verified replay actions and stores the ranking rationale, rejected paths, and missing workflows under `planner.path_ranking`.
+In LLM mode, Folio first asks the model to rank scanner-tested `candidate_paths` by demo value. The planner then builds a coverage plan from that ranking and selects every validated product workflow needed to cover the discovered functionality. The final plan uses canonical replay actions from those selected paths, inserts reset navigation between independent workflows, and stores coverage details under `planner.coverage`.
 
 By default, `--mode llm` falls back to the heuristic planner if the API key is missing or the model response cannot be used. Use `--no-fallback` when you want failures to stop the workflow.

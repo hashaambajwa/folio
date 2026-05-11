@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 
 RECORDER_VERSION = "0.1"
-SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select"}
+SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select", "navigate"}
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 DEFAULT_OBSERVE_SECONDS = 1.5
 VIEWPORT_SETTLE_MS = 250
@@ -171,6 +171,8 @@ async def _execute_action(
     }
     if action.get("selector"):
         result["selector"] = action.get("selector")
+    if action_type == "navigate" and action.get("url"):
+        result["url"] = action.get("url")
     if action_type in {"fill", "select"} and action.get("value") is not None:
         result["value"] = action.get("value")
     if action_type == "press" and action.get("key"):
@@ -216,6 +218,12 @@ async def _execute_action(
         elif action_type == "press":
             locator = await _ready_locator(page, action, action_timeout_ms)
             await locator.press(action.get("key", "Enter"), timeout=action_timeout_ms)
+            await _wait_for_settle(page)
+        elif action_type == "navigate":
+            url = action.get("url")
+            if not url:
+                raise ValueError("Navigate action requires a url")
+            await page.goto(url, wait_until="domcontentloaded", timeout=action_timeout_ms)
             await _wait_for_settle(page)
 
         result["url_after"] = page.url
