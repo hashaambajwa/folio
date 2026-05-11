@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 
 RECORDER_VERSION = "0.1"
-SUPPORTED_ACTIONS = {"observe", "click", "fill", "press"}
+SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select"}
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 DEFAULT_OBSERVE_SECONDS = 1.5
 
@@ -196,6 +196,10 @@ async def _execute_action(
         elif action_type == "fill":
             locator = await _ready_locator(page, action, action_timeout_ms)
             await locator.fill(action.get("value", ""), timeout=action_timeout_ms)
+            await page.wait_for_timeout(default_delay_ms)
+        elif action_type == "select":
+            locator = await _ready_locator(page, action, action_timeout_ms)
+            await locator.select_option(value=action.get("value", ""), timeout=action_timeout_ms)
             await page.wait_for_timeout(default_delay_ms)
         elif action_type == "press":
             locator = await _ready_locator(page, action, action_timeout_ms)

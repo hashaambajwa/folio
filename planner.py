@@ -390,7 +390,7 @@ def _llm_system_prompt() -> str:
     return (
         "You are Folio's demo planner. Create a concise browser demo plan that showcases "
         "the app's most valuable visible workflow. Return only JSON matching the provided schema. "
-        "Use only selectors present in the provided scan context for click, fill, and press actions. "
+        "Use only selectors present in the provided scan context for click, fill, press, and select actions. "
         "Use discovered states and transitions to understand UI that appears after interaction. "
         "Prefer selecting the replayable candidate_paths entry that best demonstrates the product value. "
         "When selected_path_id is set, Folio will use the scanner-tested actions from that path; use scenes to provide clear demo wording. "
@@ -483,7 +483,7 @@ def _scan_context_for_llm(scan: dict) -> dict:
         ],
         "accessibility": scan.get("accessibility"),
         "browser_errors": scan.get("browser_errors", {}),
-        "supported_action_types": ["observe", "click", "fill", "press"],
+        "supported_action_types": ["observe", "click", "fill", "press", "select"],
     }
 
 
@@ -780,7 +780,7 @@ def _llm_plan_schema() -> dict:
                                 "required": ["action_id", "type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
                                     "action_id": {"type": "string"},
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press"]},
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -872,7 +872,7 @@ def _normalize_llm_scenes(payload: dict) -> list[dict]:
 
 def _normalize_llm_action(action: dict) -> dict | None:
     action_type = action.get("type")
-    if action_type not in {"observe", "click", "fill", "press"}:
+    if action_type not in {"observe", "click", "fill", "press", "select"}:
         return None
 
     normalized = {
@@ -881,11 +881,11 @@ def _normalize_llm_action(action: dict) -> dict | None:
         "description": (action.get("description") or f"{action_type} action").strip(),
     }
     selector = action.get("selector")
-    if action_type in {"click", "fill", "press"}:
+    if action_type in {"click", "fill", "press", "select"}:
         if not selector:
             return None
         normalized["selector"] = selector
-    if action_type == "fill":
+    if action_type in {"fill", "select"}:
         normalized["value"] = action.get("value") or "Demo value"
     if action_type == "press":
         normalized["key"] = action.get("key") or "Enter"
@@ -1062,7 +1062,7 @@ def _transition_scene(transition: dict, index: int, source_path_id: str | None =
 
 def _probe_action_for_plan(action: dict, transition: dict, index: int) -> dict | None:
     action_type = action.get("type")
-    if action_type not in {"observe", "click", "fill", "press"}:
+    if action_type not in {"observe", "click", "fill", "press", "select"}:
         return None
 
     planned = {
@@ -1070,12 +1070,12 @@ def _probe_action_for_plan(action: dict, transition: dict, index: int) -> dict |
         "type": action_type,
         "description": action.get("description") or f"{action_type} during probe.",
     }
-    if action_type in {"click", "fill", "press"}:
+    if action_type in {"click", "fill", "press", "select"}:
         selector = action.get("selector")
         if not selector:
             return None
         planned["selector"] = selector
-    if action_type == "fill":
+    if action_type in {"fill", "select"}:
         planned["value"] = action.get("value") or "Demo value"
     if action_type == "press":
         planned["key"] = action.get("key") or "Enter"

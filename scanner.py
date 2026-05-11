@@ -446,6 +446,8 @@ async def _expand_states_with_llm(
             "kind": candidate["kind"],
             "goal": candidate.get("goal"),
             "expected_outcome": candidate.get("expected_outcome"),
+            "repair_note": candidate.get("repair_note"),
+            "requested_parent_state_id": candidate.get("requested_parent_state_id"),
             "origin": "llm",
             "actions": candidate["actions"],
             "status": "pending",
@@ -473,14 +475,17 @@ async def _expand_states_with_llm(
         next_state = trial["state"]
         transition["outcome_summary"] = _transition_outcome_summary(parent_state, next_state)
         duplicate_state_id = signatures.get(next_state["signature"])
-        if duplicate_state_id:
+        if duplicate_state_id and not _has_meaningful_llm_outcome(transition["outcome_summary"]):
             transition["status"] = "duplicate"
             transition["to"] = duplicate_state_id
             transitions.append(transition)
             results.append(_llm_expansion_result(candidate, transition))
             continue
 
-        signatures[next_state["signature"]] = next_state["state_id"]
+        if duplicate_state_id:
+            transition["duplicate_of"] = duplicate_state_id
+        else:
+            signatures[next_state["signature"]] = next_state["state_id"]
         transition["status"] = "success"
         transition["to"] = next_state["state_id"]
         next_state["transition"] = transition
@@ -505,12 +510,31 @@ def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
     return {
         "candidate_id": candidate.get("candidate_id"),
         "parent_state_id": candidate.get("parent_state_id"),
+        "requested_parent_state_id": candidate.get("requested_parent_state_id"),
         "label": candidate.get("label"),
         "goal": candidate.get("goal"),
+        "repair_note": candidate.get("repair_note"),
         "status": transition.get("status"),
         "to": transition.get("to"),
+        "duplicate_of": transition.get("duplicate_of"),
         "error": transition.get("error"),
     }
+
+
+def _has_meaningful_llm_outcome(outcome_summary: dict | None) -> bool:
+    if not outcome_summary:
+        return False
+    if outcome_summary.get("url_changed") or outcome_summary.get("added_text") or outcome_summary.get("removed_text"):
+        return True
+
+    for control in outcome_summary.get("changed_controls", []):
+        changes = control.get("changes", {})
+        for change in changes.values():
+            before = change.get("before")
+            after = change.get("after")
+            if str(before or "").strip() != str(after or "").strip() and str(after or "").strip():
+                return True
+    return False
 
 
 async def _run_probe_candidate(
@@ -564,7 +588,7 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
         try:
             action_type = action["type"]
             selector = action.get("selector")
-            if action_type in {"click", "fill", "press"}:
+            if action_type in {"click", "fill", "press", "select"}:
                 if not selector:
                     return {"status": "failed", "error": "Missing selector"}
                 locator = page.locator(selector).first
@@ -585,6 +609,8 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
                     )
             elif action_type == "fill":
                 await locator.fill(action.get("value", ""), timeout=PROBE_ACTION_TIMEOUT_MS)
+            elif action_type == "select":
+                await locator.select_option(value=action.get("value", ""), timeout=PROBE_ACTION_TIMEOUT_MS)
             elif action_type == "press":
                 await locator.press(action.get("key", "Enter"), timeout=PROBE_ACTION_TIMEOUT_MS)
             elif action_type == "observe":
@@ -673,9 +699,13 @@ def _llm_workflow_expander_prompt() -> str:
         "You are Folio's workflow expansion strategist. Propose a small number of safe, bounded browser workflows "
         "that demonstrate core app functionality missing from the current scanner-tested candidate paths. Use only "
         "state_id values and selectors provided in the context. Prefer main content workflows that create, calculate, "
-        "filter, save, search, preview, or otherwise produce visible product outcomes. Avoid feedback forms, generic "
+        "filter, save, search, preview, or otherwise produce visible product outcomes. Use select actions for select/dropdown "
+        "elements. Avoid feedback forms, generic "
         "site search, legal/account/navigation/footer/header actions unless those are the actual product. Return only "
-        "JSON matching the schema. Folio will validate every proposed action in Playwright before using it."
+        "JSON matching the schema. If a workflow starts from a discovered tool page, set parent_state_id to that "
+        "tool page's state and include only actions that can run from that state; do not include navigation actions "
+        "from the start page. Prefer simple text/number fields plus a Calculate, Apply, Search, Save, or Submit button "
+        "over complex selects when both are available. Folio will validate every proposed action in Playwright before using it."
     )
 
 
@@ -712,7 +742,7 @@ def _workflow_expansion_context(
             _state_for_expander(state)
             for state in states[:MAX_LLM_EXPANSION_STATES]
         ],
-        "supported_actions": ["observe", "click", "fill", "press"],
+        "supported_actions": ["observe", "click", "fill", "press", "select"],
     }
 
 
@@ -800,7 +830,7 @@ def _llm_workflow_expansion_schema() -> dict:
                                 "additionalProperties": False,
                                 "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press"]},
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -832,13 +862,33 @@ def _normalize_llm_workflow_candidates(
         if len(candidates) >= max(0, max_expansions):
             break
 
-        parent_state_id = raw_candidate.get("parent_state_id")
-        parent_state = states_by_id.get(parent_state_id)
+        requested_parent_state_id = raw_candidate.get("parent_state_id")
+        parent_state = states_by_id.get(requested_parent_state_id)
         if not parent_state:
-            rejected.append(_rejected_llm_candidate(raw_candidate, "Unknown parent_state_id."))
+            parent_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+            if not parent_state:
+                rejected.append(_rejected_llm_candidate(raw_candidate, "Unknown parent_state_id."))
+                continue
+            drop_unavailable = True
+        else:
+            repair_note = None
+            drop_unavailable = False
+            if _workflow_has_unavailable_selectors(raw_candidate, parent_state):
+                repaired_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+                if repaired_state and repaired_state.get("state_id") != parent_state.get("state_id"):
+                    parent_state = repaired_state
+                    drop_unavailable = True
+
+        parent_state_id = parent_state.get("state_id")
+        if not parent_state_id:
+            rejected.append(_rejected_llm_candidate(raw_candidate, "Repaired parent state has no state_id."))
             continue
 
-        actions, errors = _normalize_llm_workflow_actions(raw_candidate, parent_state)
+        actions, errors = _normalize_llm_workflow_actions(
+            raw_candidate,
+            parent_state,
+            drop_unavailable=drop_unavailable,
+        )
         if errors:
             rejected.append(_rejected_llm_candidate(raw_candidate, "; ".join(errors)))
             continue
@@ -851,10 +901,12 @@ def _normalize_llm_workflow_candidates(
             {
                 "candidate_id": f"llm-workflow:{parent_state_id}:{_slug(label)}",
                 "parent_state_id": parent_state_id,
+                "requested_parent_state_id": requested_parent_state_id,
                 "kind": "llm_workflow",
                 "label": label,
                 "goal": _clean_label(raw_candidate.get("goal") or label),
                 "expected_outcome": _clean_label(raw_candidate.get("expected_outcome") or ""),
+                "repair_note": repair_note,
                 "priority": 5,
                 "bounds": {},
                 "actions": actions,
@@ -864,13 +916,17 @@ def _normalize_llm_workflow_candidates(
     return candidates, rejected
 
 
-def _normalize_llm_workflow_actions(raw_candidate: dict, parent_state: dict) -> tuple[list[dict], list[str]]:
+def _normalize_llm_workflow_actions(
+    raw_candidate: dict,
+    parent_state: dict,
+    drop_unavailable: bool = False,
+) -> tuple[list[dict], list[str]]:
     selector_map = _selectors_for_state(parent_state)
     actions = []
     errors = []
     for index, raw_action in enumerate(raw_candidate.get("actions", [])[:MAX_LLM_EXPANSION_ACTIONS], 1):
         action_type = raw_action.get("type")
-        if action_type not in {"observe", "click", "fill", "press"}:
+        if action_type not in {"observe", "click", "fill", "press", "select"}:
             errors.append(f"Unsupported action type at {index}: {action_type}")
             continue
 
@@ -880,19 +936,24 @@ def _normalize_llm_workflow_actions(raw_candidate: dict, parent_state: dict) -> 
             "origin": "llm",
         }
         selector = raw_action.get("selector")
-        if action_type in {"click", "fill", "press"}:
+        if action_type in {"click", "fill", "press", "select"}:
             if not selector or selector not in selector_map:
+                if drop_unavailable:
+                    continue
                 errors.append(f"Selector is not available in parent state at {index}: {selector}")
                 continue
             element = selector_map[selector]
+            if action_type == "fill" and (element.get("tag") or "").lower() == "select":
+                action_type = "select"
+                action["type"] = "select"
             if action_type == "click" and _click_action_is_risky(element, parent_state):
                 errors.append(f"Risky click selector at {index}: {selector}")
                 continue
             action["selector"] = selector
-        if action_type == "fill":
+        if action_type in {"fill", "select"}:
             value = str(raw_action.get("value") or "").strip()
             if not value:
-                errors.append(f"Fill action missing value at {index}: {selector}")
+                errors.append(f"{action_type} action missing value at {index}: {selector}")
                 continue
             action["value"] = value[:120]
         if action_type == "press":
@@ -902,6 +963,49 @@ def _normalize_llm_workflow_actions(raw_candidate: dict, parent_state: dict) -> 
         actions.append(action)
 
     return actions, errors
+
+
+def _workflow_has_unavailable_selectors(raw_candidate: dict, state: dict) -> bool:
+    selector_map = _selectors_for_state(state)
+    for action in raw_candidate.get("actions", []):
+        if action.get("type") in {"click", "fill", "press", "select"} and action.get("selector") not in selector_map:
+            return True
+    return False
+
+
+def _best_state_for_llm_workflow(raw_candidate: dict, states_by_id: dict[str, dict]) -> tuple[dict | None, str | None]:
+    best_state = None
+    best_score = 0
+    best_matched = 0
+    for state in states_by_id.values():
+        selector_map = _selectors_for_state(state)
+        score = 0
+        matched = 0
+        for action in raw_candidate.get("actions", []):
+            selector = action.get("selector")
+            if not selector or selector not in selector_map:
+                continue
+            matched += 1
+            action_type = action.get("type")
+            if action_type == "fill":
+                score += 3
+            elif action_type in {"click", "press"}:
+                score += 2
+            else:
+                score += 1
+
+        if score > best_score:
+            best_state = state
+            best_score = score
+            best_matched = matched
+
+    if not best_state or best_score < 5 or best_matched < 2:
+        return None, None
+
+    return (
+        best_state,
+        f"Rebased workflow from {raw_candidate.get('parent_state_id')} to {best_state.get('state_id')} based on selector coverage.",
+    )
 
 
 def _selectors_for_state(state: dict) -> dict[str, dict]:
@@ -923,7 +1027,7 @@ def _click_action_is_risky(element: dict, state: dict) -> bool:
 
 def _is_meaningful_workflow(actions: list[dict]) -> bool:
     action_types = {action.get("type") for action in actions}
-    return "fill" in action_types and bool({"click", "press"} & action_types)
+    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
 
 
 def _rejected_llm_candidate(candidate: dict, reason: str) -> dict:
@@ -1061,6 +1165,9 @@ def _path_transition(transition: dict) -> dict:
         "kind": transition.get("kind"),
         "goal": transition.get("goal"),
         "expected_outcome": transition.get("expected_outcome"),
+        "repair_note": transition.get("repair_note"),
+        "requested_parent_state_id": transition.get("requested_parent_state_id"),
+        "duplicate_of": transition.get("duplicate_of"),
         "origin": transition.get("origin"),
         "actions": transition.get("actions", []),
         "status": transition.get("status"),
@@ -1445,7 +1552,7 @@ def _state_signature(url: str, dom: dict) -> str:
             "disabled": element.get("attributes", {}).get("disabled"),
             "expanded": element.get("attributes", {}).get("aria_expanded"),
         }
-        for element in dom.get("interactive", [])[:50]
+        for element in dom.get("interactive", [])[:MAX_ELEMENTS_PER_GROUP]
     ]
     payload = {
         "url": url,
