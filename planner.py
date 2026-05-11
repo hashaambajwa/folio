@@ -18,6 +18,21 @@ MAX_TRANSITION_SCENES = 5
 MAX_LLM_CANDIDATE_PATHS = 12
 MAX_LLM_TEXT_BLOCKS = 40
 MAX_LLM_INTERACTIVE_ELEMENTS = 60
+OUTCOME_FOCUS_TERMS = (
+    "answer",
+    "calculation",
+    "complete",
+    "gpa",
+    "grade",
+    "output",
+    "preview",
+    "required",
+    "result",
+    "score",
+    "status",
+    "summary",
+    "total",
+)
 
 
 def load_scan(scan_path: str | Path) -> dict:
@@ -885,6 +900,8 @@ def _normalize_llm_action(action: dict) -> dict | None:
         if not selector:
             return None
         normalized["selector"] = selector
+    elif action_type == "observe" and selector:
+        normalized["selector"] = selector
     if action_type in {"fill", "select"}:
         normalized["value"] = action.get("value") or "Demo value"
     if action_type == "press":
@@ -1043,6 +1060,7 @@ def _transition_scene(transition: dict, index: int, source_path_id: str | None =
     if not actions:
         return None
 
+    _attach_outcome_focus_action(actions, transition)
     kind = transition.get("kind") or "interaction"
     label = transition.get("label") or kind
     clean_label = _clean_transition_label(label)
@@ -1075,13 +1093,102 @@ def _probe_action_for_plan(action: dict, transition: dict, index: int) -> dict |
         if not selector:
             return None
         planned["selector"] = selector
+    elif action_type == "observe" and action.get("selector"):
+        planned["selector"] = action.get("selector")
     if action_type in {"fill", "select"}:
         planned["value"] = action.get("value") or "Demo value"
     if action_type == "press":
         planned["key"] = action.get("key") or "Enter"
     if action.get("allow_hidden"):
         planned["allow_hidden"] = True
+    if action_type == "observe" and action.get("duration_seconds"):
+        planned["duration_seconds"] = _bounded_duration(action.get("duration_seconds"))
     return planned
+
+
+def _attach_outcome_focus_action(actions: list[dict], transition: dict) -> None:
+    focus = _outcome_focus_for_transition(transition)
+    if not focus:
+        return
+
+    description = f"Keep {focus['label']} in view."
+    if actions and actions[-1].get("type") == "observe":
+        actions[-1].setdefault("selector", focus["selector"])
+        actions[-1].setdefault("duration_seconds", 2)
+        if not actions[-1].get("description"):
+            actions[-1]["description"] = description
+        return
+
+    actions.append(
+        {
+            "action_id": f"{_slug(transition.get('candidate_id') or transition.get('label') or 'probe')}-outcome",
+            "type": "observe",
+            "description": description,
+            "selector": focus["selector"],
+            "duration_seconds": 2,
+        }
+    )
+
+
+def _outcome_focus_for_transition(transition: dict) -> dict | None:
+    summary = transition.get("outcome_summary") or {}
+    if summary.get("url_changed"):
+        return None
+
+    changed_controls = summary.get("changed_controls") or []
+    if not changed_controls:
+        return None
+
+    action_selectors = {
+        action.get("selector")
+        for action in transition.get("actions", [])
+        if action.get("selector")
+    }
+    candidates = []
+    for index, control in enumerate(changed_controls):
+        selectors = control.get("selectors") or []
+        selector = selectors[0] if selectors else None
+        if not selector:
+            continue
+
+        changed_text = _changed_control_after_text(control)
+        if not changed_text:
+            continue
+
+        name = (control.get("name") or "").strip()
+        haystack = f"{name} {changed_text} {selector}".lower()
+        score = 0
+        if selector not in action_selectors:
+            score += 100
+        else:
+            score -= 30
+        score += max(0, 20 - index)
+        if any(term in haystack for term in OUTCOME_FOCUS_TERMS):
+            score += 40
+        if len(changed_text) > 12:
+            score += 10
+
+        candidates.append(
+            {
+                "score": score,
+                "selector": selector,
+                "label": name or changed_text[:48],
+            }
+        )
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate["score"])
+
+
+def _changed_control_after_text(control: dict) -> str:
+    parts = []
+    for change in (control.get("changes") or {}).values():
+        before = str(change.get("before") or "").strip()
+        after = str(change.get("after") or "").strip()
+        if after and after != before:
+            parts.append(after)
+    return " ".join(parts)
 
 
 def _clean_transition_label(label: str) -> str:

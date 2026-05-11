@@ -14,6 +14,7 @@ RECORDER_VERSION = "0.1"
 SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select"}
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 DEFAULT_OBSERVE_SECONDS = 1.5
+VIEWPORT_SETTLE_MS = 250
 
 
 def load_plan(plan_path: str | Path) -> dict:
@@ -168,6 +169,12 @@ async def _execute_action(
         "description": action.get("description"),
         "status": "success",
     }
+    if action.get("selector"):
+        result["selector"] = action.get("selector")
+    if action_type in {"fill", "select"} and action.get("value") is not None:
+        result["value"] = action.get("value")
+    if action_type == "press" and action.get("key"):
+        result["key"] = action.get("key")
 
     if action_type not in SUPPORTED_ACTIONS:
         return {
@@ -179,7 +186,12 @@ async def _execute_action(
 
     try:
         if action_type == "observe":
-            duration_seconds = min(scene.get("duration_seconds", DEFAULT_OBSERVE_SECONDS), 4)
+            if action.get("selector"):
+                await _ready_locator(page, action, action_timeout_ms)
+            duration_seconds = min(
+                action.get("duration_seconds") or scene.get("duration_seconds", DEFAULT_OBSERVE_SECONDS),
+                4,
+            )
             await page.wait_for_timeout(int(duration_seconds * 1000))
         elif action_type == "click":
             locator = await _ready_locator(page, action, action_timeout_ms)
@@ -227,8 +239,22 @@ async def _ready_locator(page, action: dict, action_timeout_ms: int):
     wait_state = "attached" if action.get("allow_hidden") else "visible"
     await locator.wait_for(state=wait_state, timeout=action_timeout_ms)
     if not action.get("allow_hidden"):
-        await locator.scroll_into_view_if_needed(timeout=action_timeout_ms)
+        await _center_locator_in_recording_view(page, locator, action_timeout_ms)
     return locator
+
+
+async def _center_locator_in_recording_view(page, locator, action_timeout_ms: int) -> None:
+    await locator.scroll_into_view_if_needed(timeout=action_timeout_ms)
+    await locator.evaluate(
+        """(element) => {
+            element.scrollIntoView({
+                block: "center",
+                inline: "center",
+                behavior: "instant"
+            });
+        }"""
+    )
+    await page.wait_for_timeout(VIEWPORT_SETTLE_MS)
 
 
 async def _wait_for_settle(page) -> None:
