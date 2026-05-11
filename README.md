@@ -103,4 +103,6 @@ export OPENAI_API_KEY=...
 python main.py plan outputs/smoke/scan.json --mode llm
 ```
 
+In LLM mode, Folio first asks the model to rank scanner-tested `candidate_paths` by demo value. If the model selects a valid path, the final plan uses that path's verified replay actions and stores the ranking rationale, rejected paths, and missing workflows under `planner.path_ranking`.
+
 By default, `--mode llm` falls back to the heuristic planner if the API key is missing or the model response cannot be used. Use `--no-fallback` when you want failures to stop the workflow.

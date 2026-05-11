@@ -161,6 +161,47 @@ def _build_llm_plan(
         )
 
     try:
+        ranker_payload = _call_openai_path_ranker(scan, api_key=api_key, model=model)
+        ranked_path_id = _ranker_selected_path_id(ranker_payload)
+        selected_path = _selected_candidate_path(scan, ranked_path_id)
+        if selected_path:
+            plan_path = _default_plan_path(scan, scan_path, output_path)
+            title = _page_title(scan.get("page", {}), scan.get("dom", {}))
+            scenes = _llm_selected_path_scenes(
+                scan,
+                selected_path,
+                _ranker_scene_payload(scan, selected_path, ranker_payload),
+            )
+            if not scenes:
+                raise ValueError("LLM path ranker selected a path without usable scenes.")
+
+            return _assemble_plan(
+                scan=scan,
+                scan_path=scan_path,
+                plan_path=plan_path,
+                title=title,
+                scenes=scenes,
+                planner={
+                    "mode": "llm",
+                    "provider": "openai",
+                    "model": model,
+                    "confidence": "llm",
+                    "needs_review": True,
+                    "fallback_used": False,
+                    "strategy": "candidate_path_rerank",
+                    "notes": [
+                        "LLM ranked scanner-tested candidate paths and selected the best available demo workflow.",
+                        "Folio used canonical replay actions from the selected path.",
+                        "Review missing_workflows to see whether deeper exploration is needed.",
+                    ],
+                    "selected_path_id": selected_path.get("path_id"),
+                    "selected_path_valid": True,
+                    "scene_source": "selected_candidate_path",
+                    "rationale": ranker_payload.get("rationale", ""),
+                    "path_ranking": _path_ranking_for_plan(ranker_payload),
+                },
+            )
+
         llm_payload = _call_openai_planner(scan, api_key=api_key, model=model)
         selected_path = _selected_candidate_path(scan, llm_payload.get("selected_path_id"))
         if selected_path:
@@ -199,6 +240,7 @@ def _build_llm_plan(
                 "selected_path_valid": bool(selected_path),
                 "scene_source": "selected_candidate_path" if selected_path else "llm_scenes",
                 "rationale": llm_payload.get("rationale", ""),
+                "path_ranking": _path_ranking_for_plan(ranker_payload),
             },
         )
     except Exception as exc:
@@ -244,28 +286,60 @@ def _handle_llm_failure(
 
 
 def _call_openai_planner(scan: dict, api_key: str, model: str) -> dict:
+    return _call_openai_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=_llm_system_prompt(),
+        context=_scan_context_for_llm(scan),
+        schema_name="folio_demo_plan",
+        schema=_llm_plan_schema(),
+        max_output_tokens=4_000,
+    )
+
+
+def _call_openai_path_ranker(scan: dict, api_key: str, model: str) -> dict:
+    return _call_openai_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=_llm_path_ranker_prompt(),
+        context=_path_ranking_context_for_llm(scan),
+        schema_name="folio_path_ranking",
+        schema=_llm_path_rank_schema(),
+        max_output_tokens=2_500,
+    )
+
+
+def _call_openai_json(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    context: dict,
+    schema_name: str,
+    schema: dict,
+    max_output_tokens: int,
+) -> dict:
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     payload = {
         "model": model,
         "input": [
             {
                 "role": "developer",
-                "content": _llm_system_prompt(),
+                "content": system_prompt,
             },
             {
                 "role": "user",
-                "content": json.dumps(_scan_context_for_llm(scan), indent=2),
+                "content": json.dumps(context, indent=2),
             },
         ],
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "folio_demo_plan",
+                "name": schema_name,
                 "strict": True,
-                "schema": _llm_plan_schema(),
+                "schema": schema,
             }
         },
-        "max_output_tokens": 4_000,
+        "max_output_tokens": max_output_tokens,
     }
     request = urllib.request.Request(
         f"{base_url}/responses",
@@ -323,6 +397,63 @@ def _llm_system_prompt() -> str:
         "Use source_context when provided to infer the app's intended routes, features, and product language. "
         "Prefer reliable workflows over broad navigation. Avoid external links unless they are the core product."
     )
+
+
+def _llm_path_ranker_prompt() -> str:
+    return (
+        "You are Folio's demo strategist. Rank only the provided scanner-tested candidate paths by how well "
+        "they showcase the app's core product value. Favor workflows that operate on the main app surface and "
+        "produce meaningful outcomes. Reject navigation, search, feedback, legal, account, and generic footer/header "
+        "paths unless they are the product itself. If no candidate path demonstrates core functionality, set "
+        "selected_path_id to null and explain the missing workflows. Return only JSON matching the schema."
+    )
+
+
+def _path_ranking_context_for_llm(scan: dict) -> dict:
+    dom = scan.get("dom", {})
+    return {
+        "page": scan.get("page", {}),
+        "source": {
+            "url": scan.get("input", {}).get("url"),
+            "final_url": scan.get("page", {}).get("final_url"),
+        },
+        "summary": dom.get("summary", {}),
+        "headings": dom.get("headings", [])[:20],
+        "text_blocks": dom.get("text_blocks", [])[:MAX_LLM_TEXT_BLOCKS],
+        "source_context": _source_context_for_llm(scan.get("source_context")),
+        "candidate_paths": [
+            _candidate_path_for_ranker(path)
+            for path in scan.get("candidate_paths", [])[:MAX_LLM_CANDIDATE_PATHS]
+        ],
+        "browser_errors": scan.get("browser_errors", {}),
+    }
+
+
+def _candidate_path_for_ranker(path: dict) -> dict:
+    return {
+        "path_id": path.get("path_id"),
+        "heuristic_score": path.get("score"),
+        "heuristic_reasons": path.get("selection_reasons", []),
+        "final_url": path.get("final_url"),
+        "same_origin": path.get("same_origin"),
+        "same_path": path.get("same_path"),
+        "labels": path.get("labels", []),
+        "kinds": path.get("kinds", []),
+        "quality_tags": path.get("quality_tags", []),
+        "action_descriptions": [
+            action.get("description") or action.get("type")
+            for action in path.get("replay_actions", [])
+        ],
+        "transition_outcomes": [
+            {
+                "label": transition.get("label"),
+                "kind": transition.get("kind"),
+                "outcome_summary": transition.get("outcome_summary"),
+            }
+            for transition in path.get("transitions", [])
+        ],
+        "final_state_summary": path.get("final_state_summary", {}),
+    }
 
 
 def _scan_context_for_llm(scan: dict) -> dict:
@@ -385,6 +516,85 @@ def _selected_candidate_path(scan: dict, path_id: str | None) -> dict | None:
         if path.get("path_id") == path_id and path.get("transitions"):
             return path
     return None
+
+
+def _ranker_selected_path_id(payload: dict) -> str | None:
+    selected_path_id = payload.get("selected_path_id")
+    if selected_path_id:
+        return selected_path_id
+    return None
+
+
+def _ranker_scene_payload(scan: dict, selected_path: dict, payload: dict) -> dict:
+    title = _page_title(scan.get("page", {}), scan.get("dom", {}))
+    selected_reason = _ranked_path_reason(payload, selected_path.get("path_id"))
+    interaction_scenes = []
+    transitions = selected_path.get("transitions", [])
+    for transition in transitions:
+        label = _clean_transition_label(transition.get("label") or transition.get("kind") or "interaction")
+        interaction_scenes.append(
+            {
+                "type": "interaction",
+                "title": _transition_title(transition.get("kind") or "interaction", label),
+                "goal": selected_reason or f"Demonstrate {label}.",
+                "duration_seconds": 6,
+                "success_criteria": "The scanner-tested transition completes and the resulting app state is visible.",
+                "narration_hint": _outcome_narration_hint(transition),
+            }
+        )
+
+    return {
+        "scenes": [
+            {
+                "type": "intro",
+                "title": f"Introduce {title}",
+                "goal": payload.get("rationale") or f"Establish what {title} does.",
+                "duration_seconds": 4,
+                "success_criteria": "The app is loaded and the main screen is visible.",
+                "narration_hint": payload.get("rationale") or f"Introduce the selected {title} workflow.",
+            },
+            *interaction_scenes,
+            {
+                "type": "outro",
+                "title": "Wrap up",
+                "goal": selected_reason or f"Close the demo after showing the selected {title} workflow.",
+                "duration_seconds": 4,
+                "success_criteria": "The final selected path state remains stable and readable.",
+                "narration_hint": selected_reason or "Summarize the app value shown in the workflow.",
+            },
+        ]
+    }
+
+
+def _ranked_path_reason(payload: dict, path_id: str | None) -> str:
+    for item in payload.get("ranked_paths", []):
+        if item.get("path_id") == path_id:
+            return (item.get("reason") or "").strip()
+    return ""
+
+
+def _outcome_narration_hint(transition: dict) -> str:
+    summary = transition.get("outcome_summary") or {}
+    added_text = summary.get("added_text") or []
+    changed_controls = summary.get("changed_controls") or []
+    if added_text:
+        return f"Call out the new visible result: {', '.join(added_text[:3])}."
+    if changed_controls:
+        changed_names = [control.get("name") for control in changed_controls if control.get("name")]
+        if changed_names:
+            return f"Call out the changed control state for {', '.join(changed_names[:3])}."
+    if summary.get("url_changed"):
+        return "Explain why this navigation matters to the app workflow."
+    return "Explain what this interaction contributes to the workflow."
+
+
+def _path_ranking_for_plan(payload: dict) -> dict:
+    return {
+        "rationale": payload.get("rationale", ""),
+        "ranked_paths": payload.get("ranked_paths", [])[:8],
+        "rejected_paths": payload.get("rejected_paths", [])[:12],
+        "missing_workflows": payload.get("missing_workflows", [])[:8],
+    }
 
 
 def _llm_selected_path_scenes(scan: dict, selected_path: dict, payload: dict) -> list[dict]:
@@ -581,6 +791,50 @@ def _llm_plan_schema() -> dict:
                         },
                     },
                 },
+            },
+        },
+    }
+
+
+def _llm_path_rank_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "selected_path_id", "ranked_paths", "rejected_paths", "missing_workflows"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "selected_path_id": {"type": ["string", "null"]},
+            "ranked_paths": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path_id", "demo_value_score", "reason"],
+                    "properties": {
+                        "path_id": {"type": "string"},
+                        "demo_value_score": {"type": "number", "minimum": 0, "maximum": 1},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "rejected_paths": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path_id", "reason"],
+                    "properties": {
+                        "path_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "missing_workflows": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string"},
             },
         },
     }
