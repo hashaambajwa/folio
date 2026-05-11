@@ -34,6 +34,7 @@ DEFAULT_PROBE_DEPTH = 3
 DEFAULT_MAX_STATES = 16
 DEFAULT_MAX_ACTIONS_PER_STATE = 5
 MAX_CANDIDATE_PATHS = 30
+MAX_OUTCOME_ITEMS = 12
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
@@ -312,6 +313,7 @@ async def _explore_states(
                 continue
 
             next_state = trial["state"]
+            transition["outcome_summary"] = _transition_outcome_summary(current_state, next_state)
             duplicate_state_id = signatures.get(next_state["signature"])
             if duplicate_state_id:
                 transition["status"] = "duplicate"
@@ -538,7 +540,149 @@ def _path_transition(transition: dict) -> dict:
         "kind": transition.get("kind"),
         "actions": transition.get("actions", []),
         "status": transition.get("status"),
+        "outcome_summary": transition.get("outcome_summary"),
     }
+
+
+def _transition_outcome_summary(before_state: dict, after_state: dict) -> dict:
+    before_dom = before_state.get("dom", {})
+    after_dom = after_state.get("dom", {})
+    before_controls = _controls_by_identity(before_dom.get("interactive", []))
+    after_controls = _controls_by_identity(after_dom.get("interactive", []))
+
+    added_control_keys = [key for key in after_controls if key not in before_controls]
+    removed_control_keys = [key for key in before_controls if key not in after_controls]
+    common_control_keys = [key for key in after_controls if key in before_controls]
+
+    changed_controls = []
+    for key in common_control_keys:
+        before_control = before_controls[key]
+        after_control = after_controls[key]
+        changes = _control_state_changes(before_control, after_control)
+        if changes:
+            changed_controls.append(
+                {
+                    "name": after_control.get("name") or before_control.get("name") or key,
+                    "selectors": after_control.get("selectors") or before_control.get("selectors") or [],
+                    "changes": changes,
+                }
+            )
+
+    added_text = _ordered_difference(
+        _normalized_text_items(after_dom.get("text_blocks", [])),
+        _normalized_text_items(before_dom.get("text_blocks", [])),
+    )
+    removed_text = _ordered_difference(
+        _normalized_text_items(before_dom.get("text_blocks", [])),
+        _normalized_text_items(after_dom.get("text_blocks", [])),
+    )
+
+    return {
+        "url_changed": before_state.get("url") != after_state.get("url"),
+        "before_url": before_state.get("url"),
+        "after_url": after_state.get("url"),
+        "added_text": added_text[:MAX_OUTCOME_ITEMS],
+        "removed_text": removed_text[:MAX_OUTCOME_ITEMS],
+        "added_controls": [
+            _control_label(after_controls[key])
+            for key in added_control_keys[:MAX_OUTCOME_ITEMS]
+        ],
+        "removed_controls": [
+            _control_label(before_controls[key])
+            for key in removed_control_keys[:MAX_OUTCOME_ITEMS]
+        ],
+        "changed_controls": changed_controls[:MAX_OUTCOME_ITEMS],
+        "counts": {
+            "before_text_blocks": len(before_dom.get("text_blocks", [])),
+            "after_text_blocks": len(after_dom.get("text_blocks", [])),
+            "before_interactive": len(before_dom.get("interactive", [])),
+            "after_interactive": len(after_dom.get("interactive", [])),
+        },
+    }
+
+
+def _normalized_text_items(items: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for item in items:
+        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        if len(text) <= 1 or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
+def _ordered_difference(left: list[str], right: list[str]) -> list[str]:
+    right_set = set(right)
+    return [item for item in left if item not in right_set]
+
+
+def _controls_by_identity(elements: list[dict]) -> dict[str, dict]:
+    controls = {}
+    for index, element in enumerate(elements):
+        key = _control_identity(element, index)
+        controls[key] = _control_summary(element)
+    return controls
+
+
+def _control_identity(element: dict, index: int) -> str:
+    selector = _first_selector(element)
+    if selector:
+        return f"selector:{selector}"
+
+    name = _element_name(element)
+    tag = element.get("tag") or ""
+    role = element.get("role") or ""
+    input_type = element.get("type") or ""
+    bounds = element.get("bounds", {})
+    if name:
+        return f"named:{tag}:{role}:{input_type}:{name}"
+    return f"bounds:{tag}:{role}:{input_type}:{bounds.get('x')}:{bounds.get('y')}:{index}"
+
+
+def _control_summary(element: dict) -> dict:
+    attrs = element.get("attributes", {})
+    return {
+        "name": _element_name(element),
+        "tag": element.get("tag"),
+        "type": element.get("type"),
+        "role": element.get("role"),
+        "text": element.get("text"),
+        "selectors": element.get("selectors", [])[:2],
+        "checked": attrs.get("checked"),
+        "disabled": attrs.get("disabled"),
+        "selected": attrs.get("selected"),
+        "expanded": attrs.get("aria_expanded"),
+    }
+
+
+def _control_label(control: dict) -> str:
+    name = control.get("name") or control.get("text")
+    if name:
+        return name
+
+    selectors = control.get("selectors") or []
+    selector = selectors[0] if selectors else None
+    if selector:
+        return selector
+
+    return " ".join(
+        value
+        for value in (control.get("tag"), control.get("type"), control.get("role"))
+        if value
+    ) or "control"
+
+
+def _control_state_changes(before_control: dict, after_control: dict) -> dict:
+    changes = {}
+    for key in ("name", "text", "checked", "disabled", "selected", "expanded"):
+        if before_control.get(key) != after_control.get(key):
+            changes[key] = {
+                "before": before_control.get(key),
+                "after": after_control.get(key),
+            }
+    return changes
 
 
 def _candidate_path_score(

@@ -68,6 +68,8 @@ Use `--no-probes` when you only want the first loaded page state.
 
 When probes are enabled, `scan.json` also includes `candidate_paths`: scored, replayable workflows assembled from the discovered state graph. Paths that create or mutate state are ranked above passive navigation because they usually make stronger demos. In LLM mode, a valid `selected_path_id` causes Folio to use the scanner-tested actions from that path while applying the LLM's wording to the plan.
 
+Successful probe transitions include `outcome_summary` with URL, visible text, control, and control-state changes. These summaries help planners explain why a path is useful instead of relying only on selectors.
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash
