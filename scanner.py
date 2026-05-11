@@ -35,6 +35,10 @@ DEFAULT_MAX_STATES = 16
 DEFAULT_MAX_ACTIONS_PER_STATE = 5
 MAX_CANDIDATE_PATHS = 30
 PROBE_ACTION_TIMEOUT_MS = 8_000
+STATE_CHANGING_KIND_BONUSES = {
+    "input_submit": 6,
+    "toggle": 8,
+}
 RISK_WORDS = {
     "account",
     "billing",
@@ -490,6 +494,7 @@ def _state_path_transitions(state: dict, states_by_id: dict[str, dict]) -> list[
 def _candidate_path_for_state(start_url: str, state: dict, transitions: list[dict]) -> dict:
     labels = [transition.get("label") for transition in transitions if transition.get("label")]
     kinds = sorted({transition.get("kind") for transition in transitions if transition.get("kind")})
+    quality_tags = _candidate_path_quality_tags(transitions)
     replay_actions = state.get("replay_actions", [])
     action_types = sorted({action.get("type") for action in replay_actions if action.get("type")})
     final_url = state.get("url")
@@ -516,6 +521,7 @@ def _candidate_path_for_state(start_url: str, state: dict, transitions: list[dic
         "route_fragment": urlparse(final_url or "").fragment,
         "labels": labels,
         "kinds": kinds,
+        "quality_tags": quality_tags,
         "action_types": action_types,
         "replay_actions": replay_actions,
         "transitions": transitions,
@@ -567,7 +573,39 @@ def _candidate_path_score(
         score += len(action_types) * 2
         reasons.append(f"uses {', '.join(action_types)} actions")
 
+    kind_set = set(kinds)
+    for kind, bonus in STATE_CHANGING_KIND_BONUSES.items():
+        if kind in kind_set:
+            score += bonus
+            reasons.append(f"includes state-changing {kind} interaction")
+
+    if {"input_submit", "toggle"}.issubset(kind_set):
+        score += 8
+        reasons.append("creates content and then changes its state")
+
+    final_kind = transitions[-1].get("kind") if transitions else None
+    if final_kind in STATE_CHANGING_KIND_BONUSES:
+        score += 4
+        reasons.append("ends with a state-changing interaction")
+
     return score, reasons
+
+
+def _candidate_path_quality_tags(transitions: list[dict]) -> list[str]:
+    kinds = [transition.get("kind") for transition in transitions if transition.get("kind")]
+    kind_set = set(kinds)
+    tags = []
+
+    if "input_submit" in kind_set:
+        tags.append("submits_input")
+    if "toggle" in kind_set:
+        tags.append("changes_state")
+    if {"input_submit", "toggle"}.issubset(kind_set):
+        tags.append("creates_then_mutates")
+    if kinds and kinds[-1] in STATE_CHANGING_KIND_BONUSES:
+        tags.append("state_changing_finish")
+
+    return tags
 
 
 def _state_summary_for_path(state: dict) -> dict:

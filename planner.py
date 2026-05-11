@@ -369,6 +369,7 @@ def _candidate_path_for_llm(path: dict) -> dict:
         "route_fragment": path.get("route_fragment"),
         "labels": path.get("labels", []),
         "kinds": path.get("kinds", []),
+        "quality_tags": path.get("quality_tags", []),
         "action_types": path.get("action_types", []),
         "replay_actions": path.get("replay_actions", []),
         "transitions": path.get("transitions", []),
