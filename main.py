@@ -5,7 +5,14 @@ import argparse
 from planner import write_plan
 from recorder import run_record
 from renderer import render
-from scanner import DEFAULT_MAX_ACTIONS_PER_STATE, DEFAULT_MAX_STATES, DEFAULT_PROBE_DEPTH, MAX_LLM_EXPANSIONS, run_scan
+from scanner import (
+    DEFAULT_MAX_ACTIONS_PER_STATE,
+    DEFAULT_MAX_STATES,
+    DEFAULT_PROBE_DEPTH,
+    MAX_LLM_EXPANSIONS,
+    MAX_LLM_EXPLORATION_GOALS,
+    run_scan,
+)
 from source_context import (
     MAX_COMPONENTS,
     MAX_FILE_BYTES,
@@ -61,12 +68,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ask an LLM for additional workflow candidates and validate them with Playwright",
     )
-    scan_parser.add_argument("--llm-model", help="OpenAI model for --llm-expand")
+    scan_parser.add_argument(
+        "--llm-goals",
+        action="store_true",
+        help="ask an LLM to map app functionality and propose exploration goals without executing them",
+    )
+    scan_parser.add_argument("--llm-model", help="OpenAI model for LLM-powered scan stages")
     scan_parser.add_argument(
         "--max-llm-expansions",
         default=MAX_LLM_EXPANSIONS,
         type=int,
         help="maximum LLM-proposed workflow candidates to validate",
+    )
+    scan_parser.add_argument(
+        "--max-llm-goals",
+        default=MAX_LLM_EXPLORATION_GOALS,
+        type=int,
+        help="maximum LLM exploration goals to keep",
     )
     scan_parser.add_argument(
         "--source-root",
@@ -201,8 +219,10 @@ def handle_scan(args: argparse.Namespace) -> int:
         source_max_file_chars=args.source_max_file_chars,
         source_max_file_bytes=args.source_max_file_bytes,
         llm_expand=args.llm_expand,
+        llm_goals=args.llm_goals,
         llm_model=args.llm_model,
         max_llm_expansions=args.max_llm_expansions,
+        max_llm_goals=args.max_llm_goals,
     )
 
     dom = result["dom"]
@@ -220,6 +240,14 @@ def handle_scan(args: argparse.Namespace) -> int:
             "LLM expansion: "
             f"{llm_expansion.get('status')} "
             f"({llm_expansion.get('accepted', 0)}/{llm_expansion.get('attempted', 0)} accepted)"
+        )
+    exploration_goals = result.get("exploration_goals", {})
+    if exploration_goals.get("status") != "disabled":
+        print(
+            "Exploration goals: "
+            f"{exploration_goals.get('status')} "
+            f"({exploration_goals.get('goal_count', 0)} goals, "
+            f"{exploration_goals.get('workflow_candidate_count', 0)} workflow candidates)"
         )
     source_context = result.get("source_context")
     if source_context:

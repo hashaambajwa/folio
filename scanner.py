@@ -44,6 +44,9 @@ MAX_LLM_EXPANSIONS = 2
 MAX_LLM_EXPANSION_ACTIONS = 8
 MAX_LLM_EXPANSION_STATES = 10
 MAX_LLM_EXPANSION_ELEMENTS = 80
+MAX_LLM_EXPLORATION_GOALS = 12
+MAX_LLM_GOAL_WORKFLOWS = 4
+MAX_LLM_GOAL_STATES = 16
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
@@ -99,8 +102,10 @@ async def scan(
     source_max_file_chars: int = MAX_FILE_CHARS,
     source_max_file_bytes: int = MAX_FILE_BYTES,
     llm_expand: bool = False,
+    llm_goals: bool = False,
     llm_model: str | None = None,
     max_llm_expansions: int = MAX_LLM_EXPANSIONS,
+    max_llm_goals: int = MAX_LLM_EXPLORATION_GOALS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -115,6 +120,7 @@ async def scan(
     transitions: list[dict] = []
     candidate_paths: list[dict] = []
     llm_expansion: dict = {"status": "disabled"}
+    exploration_goals: dict = {"status": "disabled"}
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -188,6 +194,16 @@ async def scan(
                     max_expansions=max_llm_expansions,
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
+
+            if llm_goals:
+                exploration_goals = _generate_llm_exploration_goals(
+                    start_url=final_url,
+                    states=states,
+                    candidate_paths=candidate_paths,
+                    source_context=source_context,
+                    model=llm_model,
+                    max_goals=max_llm_goals,
+                )
         finally:
             await context.close()
             await browser.close()
@@ -205,8 +221,10 @@ async def scan(
             "max_states": max_states,
             "max_actions_per_state": max_actions_per_state,
             "llm_expand": llm_expand,
+            "llm_goals": llm_goals,
             "llm_model": llm_model,
             "max_llm_expansions": max_llm_expansions,
+            "max_llm_goals": max_llm_goals,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -238,6 +256,7 @@ async def scan(
         "transitions": transitions,
         "candidate_paths": candidate_paths,
         "llm_expansion": llm_expansion,
+        "exploration_goals": exploration_goals,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -673,6 +692,119 @@ def _call_openai_workflow_expander(context: dict, api_key: str, model: str) -> d
     return json.loads(output_text)
 
 
+def _generate_llm_exploration_goals(
+    start_url: str,
+    states: list[dict],
+    candidate_paths: list[dict],
+    source_context: dict | None,
+    model: str | None,
+    max_goals: int,
+) -> dict:
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "skipped",
+            "reason": "Missing OPENAI_API_KEY.",
+            "model": model,
+            "goal_count": 0,
+            "workflow_candidate_count": 0,
+        }
+
+    try:
+        payload = _call_openai_exploration_goals(
+            _exploration_goal_context(
+                start_url=start_url,
+                states=states,
+                candidate_paths=candidate_paths,
+                source_context=source_context,
+                max_goals=max_goals,
+            ),
+            api_key=api_key,
+            model=model,
+            max_goals=max_goals,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "model": model,
+            "error": f"{type(exc).__name__}: {exc}",
+            "goal_count": 0,
+            "workflow_candidate_count": 0,
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    normalized = _normalize_exploration_goal_payload(
+        payload,
+        states_by_id=states_by_id,
+        max_goals=max_goals,
+    )
+    normalized.update(
+        {
+            "status": "completed",
+            "model": model,
+            "goal_count": len(normalized.get("goals", [])),
+            "workflow_candidate_count": sum(
+                len(goal.get("workflow_candidates", []))
+                for goal in normalized.get("goals", [])
+            ),
+        }
+    )
+    return normalized
+
+
+def _call_openai_exploration_goals(context: dict, api_key: str, model: str, max_goals: int) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_exploration_goal_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(context, indent=2),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_exploration_goals",
+                "strict": True,
+                "schema": _llm_exploration_goal_schema(max_goals),
+            }
+        },
+        "max_output_tokens": 10_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=75, context=_https_context()) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
 def _https_context() -> ssl.SSLContext:
     try:
         import certifi
@@ -706,6 +838,22 @@ def _llm_workflow_expander_prompt() -> str:
         "tool page's state and include only actions that can run from that state; do not include navigation actions "
         "from the start page. Prefer simple text/number fields plus a Calculate, Apply, Search, Save, or Submit button "
         "over complex selects when both are available. Folio will validate every proposed action in Playwright before using it."
+    )
+
+
+def _llm_exploration_goal_prompt() -> str:
+    return (
+        "You are Folio's product exploration strategist. Your job is to understand the application as a product, "
+        "map its meaningful feature areas, and propose exploration goals that would maximize functional coverage. "
+        "Use the provided states, candidate paths, source hints, routes, text, forms, and selectors. Distinguish "
+        "validated workflows from missing or partially discovered functionality. Prefer core product workflows over "
+        "generic search, feedback, legal, account, header, footer, and site navigation unless those are the product. "
+        "If you propose browser actions, use only selectors present in the provided state context and set the correct "
+        "parent_state_id. If a feature appears important but no usable selectors or state are available, return it as "
+        "needs_discovery with blockers instead of inventing selectors. Return only JSON matching the schema. Folio "
+        "will treat every workflow candidate as untrusted until Playwright validates it. Keep each description, "
+        "hypothesis, evidence item, blocker, and outcome concise. For already validated features, include workflow "
+        "candidates only for meaningfully distinct variations that are not already covered by candidate_paths."
     )
 
 
@@ -743,6 +891,53 @@ def _workflow_expansion_context(
             for state in states[:MAX_LLM_EXPANSION_STATES]
         ],
         "supported_actions": ["observe", "click", "fill", "press", "select"],
+    }
+
+
+def _exploration_goal_context(
+    start_url: str,
+    states: list[dict],
+    candidate_paths: list[dict],
+    source_context: dict | None,
+    max_goals: int,
+) -> dict:
+    return {
+        "start_url": start_url,
+        "goal": "Map app functionality and propose validation goals for maximum product coverage.",
+        "limits": {
+            "max_goals": max_goals,
+            "max_workflow_candidates_per_goal": MAX_LLM_GOAL_WORKFLOWS,
+            "supported_actions": ["observe", "click", "fill", "press", "select"],
+        },
+        "source_context": _source_context_for_expander(source_context),
+        "candidate_paths": [
+            {
+                "path_id": path.get("path_id"),
+                "score": path.get("score"),
+                "labels": path.get("labels", []),
+                "kinds": path.get("kinds", []),
+                "quality_tags": path.get("quality_tags", []),
+                "action_types": path.get("action_types", []),
+                "final_state_id": path.get("final_state_id"),
+                "final_url": path.get("final_url"),
+                "selection_reasons": path.get("selection_reasons", []),
+                "transition_outcomes": [
+                    {
+                        "label": transition.get("label"),
+                        "kind": transition.get("kind"),
+                        "goal": transition.get("goal"),
+                        "expected_outcome": transition.get("expected_outcome"),
+                        "outcome_summary": transition.get("outcome_summary"),
+                    }
+                    for transition in path.get("transitions", [])
+                ],
+            }
+            for path in candidate_paths[:MAX_CANDIDATE_PATHS]
+        ],
+        "states": [
+            _state_for_expander(state)
+            for state in states[:MAX_LLM_GOAL_STATES]
+        ],
     }
 
 
@@ -851,6 +1046,151 @@ def _llm_workflow_expansion_schema() -> dict:
     }
 
 
+def _llm_exploration_goal_schema(max_goals: int) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "app_summary", "feature_areas", "exploration_goals", "deprioritized_goals"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "app_summary": {"type": "string"},
+            "feature_areas": {
+                "type": "array",
+                "maxItems": max_goals,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "feature_id",
+                        "title",
+                        "description",
+                        "validation_status",
+                        "evidence",
+                        "related_state_ids",
+                        "related_path_ids",
+                    ],
+                    "properties": {
+                        "feature_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "validation_status": {
+                            "type": "string",
+                            "enum": ["validated", "partial", "needs_validation", "needs_discovery", "not_app_core"],
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                        "related_state_ids": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                        "related_path_ids": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "exploration_goals": {
+                "type": "array",
+                "maxItems": max_goals,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "goal_id",
+                        "title",
+                        "feature",
+                        "priority",
+                        "status",
+                        "start_state_id",
+                        "hypothesis",
+                        "expected_outcome",
+                        "evidence",
+                        "related_path_ids",
+                        "workflow_candidates",
+                        "blockers",
+                    ],
+                    "properties": {
+                        "goal_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "feature": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "status": {
+                            "type": "string",
+                            "enum": ["validated", "needs_validation", "needs_discovery", "blocked", "deprioritized"],
+                        },
+                        "start_state_id": {"type": ["string", "null"]},
+                        "hypothesis": {"type": "string"},
+                        "expected_outcome": {"type": "string"},
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                        "related_path_ids": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                        "workflow_candidates": {
+                            "type": "array",
+                            "maxItems": MAX_LLM_GOAL_WORKFLOWS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "parent_state_id",
+                                    "label",
+                                    "confidence",
+                                    "actions",
+                                ],
+                                "properties": {
+                                    "parent_state_id": {"type": "string"},
+                                    "label": {"type": "string"},
+                                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                                    "actions": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": MAX_LLM_EXPANSION_ACTIONS,
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": False,
+                                            "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
+                                            "properties": {
+                                                "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                                "description": {"type": "string"},
+                                                "selector": {"type": ["string", "null"]},
+                                                "value": {"type": ["string", "null"]},
+                                                "key": {"type": ["string", "null"]},
+                                                "allow_hidden": {"type": "boolean"},
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "blockers": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "deprioritized_goals": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string"},
+            },
+        },
+    }
+
+
 def _normalize_llm_workflow_candidates(
     payload: dict,
     states_by_id: dict[str, dict],
@@ -914,6 +1254,185 @@ def _normalize_llm_workflow_candidates(
         )
 
     return candidates, rejected
+
+
+def _normalize_exploration_goal_payload(
+    payload: dict,
+    states_by_id: dict[str, dict],
+    max_goals: int,
+) -> dict:
+    feature_areas = []
+    for raw_feature in payload.get("feature_areas", [])[:max_goals]:
+        feature_areas.append(
+            {
+                "feature_id": _slug(raw_feature.get("feature_id") or raw_feature.get("title") or "feature"),
+                "title": _clean_label(raw_feature.get("title") or "Feature"),
+                "description": _clean_label(raw_feature.get("description") or ""),
+                "validation_status": _enum_value(
+                    raw_feature.get("validation_status"),
+                    {"validated", "partial", "needs_validation", "needs_discovery", "not_app_core"},
+                    "needs_discovery",
+                ),
+                "evidence": _clean_string_list(raw_feature.get("evidence"), limit=6),
+                "related_state_ids": _known_state_ids(raw_feature.get("related_state_ids"), states_by_id, limit=8),
+                "related_path_ids": _clean_string_list(raw_feature.get("related_path_ids"), limit=8),
+            }
+        )
+
+    goals = []
+    rejected_candidates = []
+    for raw_goal in payload.get("exploration_goals", [])[:max_goals]:
+        goal_id = _slug(raw_goal.get("goal_id") or raw_goal.get("title") or "exploration-goal")
+        workflow_candidates, rejected = _normalize_goal_workflow_candidates(raw_goal, states_by_id, goal_id)
+        rejected_candidates.extend(rejected)
+
+        start_state_id = raw_goal.get("start_state_id")
+        if start_state_id not in states_by_id:
+            start_state_id = None
+
+        blockers = _clean_string_list(raw_goal.get("blockers"), limit=6)
+        if raw_goal.get("workflow_candidates") and not workflow_candidates:
+            blockers.append("No workflow candidates survived selector normalization; validation needs a deeper scan.")
+
+        goals.append(
+            {
+                "goal_id": goal_id,
+                "title": _clean_label(raw_goal.get("title") or goal_id),
+                "feature": _clean_label(raw_goal.get("feature") or raw_goal.get("title") or goal_id),
+                "priority": _enum_value(raw_goal.get("priority"), {"high", "medium", "low"}, "medium"),
+                "status": _normalized_goal_status(raw_goal.get("status"), workflow_candidates, blockers),
+                "start_state_id": start_state_id,
+                "hypothesis": _clean_label(raw_goal.get("hypothesis") or ""),
+                "expected_outcome": _clean_label(raw_goal.get("expected_outcome") or ""),
+                "evidence": _clean_string_list(raw_goal.get("evidence"), limit=6),
+                "related_path_ids": _clean_string_list(raw_goal.get("related_path_ids"), limit=8),
+                "workflow_candidates": workflow_candidates,
+                "blockers": blockers[:6],
+            }
+        )
+
+    return {
+        "rationale": _clean_label(payload.get("rationale") or ""),
+        "app_summary": _clean_label(payload.get("app_summary") or ""),
+        "feature_areas": feature_areas,
+        "goals": goals,
+        "deprioritized_goals": _clean_string_list(payload.get("deprioritized_goals"), limit=8),
+        "rejected_workflow_candidates": rejected_candidates,
+    }
+
+
+def _normalize_goal_workflow_candidates(
+    raw_goal: dict,
+    states_by_id: dict[str, dict],
+    goal_id: str,
+) -> tuple[list[dict], list[dict]]:
+    normalized_candidates = []
+    rejected = []
+    for index, raw_candidate in enumerate(raw_goal.get("workflow_candidates", [])[:MAX_LLM_GOAL_WORKFLOWS], 1):
+        requested_parent_state_id = raw_candidate.get("parent_state_id")
+        parent_state = states_by_id.get(requested_parent_state_id)
+        repair_note = None
+        drop_unavailable = False
+        if not parent_state:
+            parent_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+            drop_unavailable = bool(parent_state)
+        elif _workflow_has_unavailable_selectors(raw_candidate, parent_state):
+            repaired_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+            if repaired_state and repaired_state.get("state_id") != parent_state.get("state_id"):
+                parent_state = repaired_state
+                drop_unavailable = True
+
+        if not parent_state:
+            rejected.append(
+                {
+                    "goal_id": goal_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": "Unknown parent_state_id and no alternate state had enough selector coverage.",
+                }
+            )
+            continue
+
+        actions, errors = _normalize_llm_workflow_actions(
+            raw_candidate,
+            parent_state,
+            drop_unavailable=drop_unavailable,
+        )
+        if errors:
+            rejected.append(
+                {
+                    "goal_id": goal_id,
+                    "label": raw_candidate.get("label"),
+                    "parent_state_id": requested_parent_state_id,
+                    "reason": "; ".join(errors),
+                }
+            )
+            continue
+        if not _is_meaningful_workflow(actions):
+            rejected.append(
+                {
+                    "goal_id": goal_id,
+                    "label": raw_candidate.get("label"),
+                    "parent_state_id": requested_parent_state_id,
+                    "reason": "Workflow candidate must include fill/select and click/press actions.",
+                }
+            )
+            continue
+
+        label = _clean_label(raw_candidate.get("label") or f"Workflow {index}")
+        parent_state_id = parent_state.get("state_id")
+        normalized_candidates.append(
+            {
+                "candidate_id": f"exploration-goal:{goal_id}:{_slug(label)}",
+                "parent_state_id": parent_state_id,
+                "requested_parent_state_id": requested_parent_state_id,
+                "label": label,
+                "confidence": _enum_value(raw_candidate.get("confidence"), {"high", "medium", "low"}, "medium"),
+                "requires_validation": True,
+                "repair_note": repair_note,
+                "actions": actions,
+            }
+        )
+
+    return normalized_candidates, rejected
+
+
+def _normalized_goal_status(status: str | None, workflow_candidates: list[dict], blockers: list[str]) -> str:
+    normalized = _enum_value(
+        status,
+        {"validated", "needs_validation", "needs_discovery", "blocked", "deprioritized"},
+        "needs_discovery",
+    )
+    if workflow_candidates and normalized in {"needs_discovery", "blocked"}:
+        return "needs_validation"
+    if blockers and normalized == "needs_validation" and not workflow_candidates:
+        return "needs_discovery"
+    return normalized
+
+
+def _enum_value(value: str | None, allowed: set[str], fallback: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else fallback
+
+
+def _clean_string_list(values: object, limit: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        text = _clean_label(value)
+        if text:
+            cleaned.append(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _known_state_ids(values: object, states_by_id: dict[str, dict], limit: int) -> list[str]:
+    return [
+        state_id
+        for state_id in _clean_string_list(values, limit=limit)
+        if state_id in states_by_id
+    ][:limit]
 
 
 def _normalize_llm_workflow_actions(

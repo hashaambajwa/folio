@@ -76,6 +76,12 @@ Use `--llm-expand` when the initial probe graph finds useful pages but misses th
 python main.py scan https://example.com --llm-expand --max-llm-expansions 2
 ```
 
+Use `--llm-goals` when you want the LLM to map the app's feature areas and propose exploration goals before another validation pass. Goal workflow candidates are normalized against discovered selectors but remain untrusted until a later Playwright validation step.
+
+```bash
+python main.py scan https://example.com --llm-goals --max-llm-goals 12
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash
