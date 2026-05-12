@@ -47,11 +47,13 @@ MAX_LLM_EXPANSION_ELEMENTS = 80
 MAX_LLM_EXPLORATION_GOALS = 12
 MAX_LLM_GOAL_WORKFLOWS = 4
 MAX_LLM_GOAL_STATES = 16
+MAX_LLM_GOAL_VALIDATIONS = 8
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
     "toggle": 8,
     "llm_workflow": 24,
+    "llm_goal_workflow": 24,
 }
 RISK_WORDS = {
     "account",
@@ -103,9 +105,11 @@ async def scan(
     source_max_file_bytes: int = MAX_FILE_BYTES,
     llm_expand: bool = False,
     llm_goals: bool = False,
+    validate_goals: bool = False,
     llm_model: str | None = None,
     max_llm_expansions: int = MAX_LLM_EXPANSIONS,
     max_llm_goals: int = MAX_LLM_EXPLORATION_GOALS,
+    max_goal_validations: int = MAX_LLM_GOAL_VALIDATIONS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -121,6 +125,7 @@ async def scan(
     candidate_paths: list[dict] = []
     llm_expansion: dict = {"status": "disabled"}
     exploration_goals: dict = {"status": "disabled"}
+    goal_validation: dict = {"status": "disabled"}
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -195,7 +200,7 @@ async def scan(
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
 
-            if llm_goals:
+            if llm_goals or validate_goals:
                 exploration_goals = _generate_llm_exploration_goals(
                     start_url=final_url,
                     states=states,
@@ -204,6 +209,22 @@ async def scan(
                     model=llm_model,
                     max_goals=max_llm_goals,
                 )
+
+            if validate_goals:
+                goal_validation = await _validate_exploration_goal_candidates(
+                    browser=browser,
+                    start_url=final_url,
+                    output_dir=output_dir,
+                    states=states,
+                    transitions=transitions,
+                    exploration_goals=exploration_goals,
+                    viewport=viewport,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    timeout_ms=timeout_ms,
+                    max_validations=max_goal_validations,
+                )
+                candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
             await browser.close()
@@ -222,9 +243,11 @@ async def scan(
             "max_actions_per_state": max_actions_per_state,
             "llm_expand": llm_expand,
             "llm_goals": llm_goals,
+            "validate_goals": validate_goals,
             "llm_model": llm_model,
             "max_llm_expansions": max_llm_expansions,
             "max_llm_goals": max_llm_goals,
+            "max_goal_validations": max_goal_validations,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -257,6 +280,7 @@ async def scan(
         "candidate_paths": candidate_paths,
         "llm_expansion": llm_expansion,
         "exploration_goals": exploration_goals,
+        "goal_validation": goal_validation,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -447,13 +471,71 @@ async def _expand_states_with_llm(
         for state in states
         if state.get("signature") and state.get("state_id")
     }
+    accepted, attempted, results = await _validate_workflow_candidates(
+        browser=browser,
+        start_url=start_url,
+        output_dir=output_dir,
+        states=states,
+        transitions=transitions,
+        viewport=viewport,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        timeout_ms=timeout_ms,
+        candidates=candidates,
+        states_by_id=states_by_id,
+        signatures=signatures,
+        default_origin="llm",
+    )
+
+    return {
+        "status": "completed",
+        "model": model,
+        "rationale": payload.get("rationale", ""),
+        "attempted": attempted,
+        "accepted": accepted,
+        "rejected": rejected,
+        "results": results,
+    }
+
+
+async def _validate_workflow_candidates(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    candidates: list[dict],
+    states_by_id: dict[str, dict] | None = None,
+    signatures: dict[str, str] | None = None,
+    default_origin: str = "llm",
+) -> tuple[int, int, list[dict]]:
+    states_by_id = states_by_id or {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    signatures = signatures or {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+
     accepted = 0
     attempted = 0
     results = []
-
     for candidate in candidates:
         parent_state = states_by_id.get(candidate["parent_state_id"])
         if not parent_state:
+            results.append(
+                {
+                    **_llm_expansion_result(candidate, {"status": "skipped", "error": "Unknown parent_state_id."}),
+                    "status": "skipped",
+                }
+            )
             continue
 
         attempted += 1
@@ -467,7 +549,10 @@ async def _expand_states_with_llm(
             "expected_outcome": candidate.get("expected_outcome"),
             "repair_note": candidate.get("repair_note"),
             "requested_parent_state_id": candidate.get("requested_parent_state_id"),
-            "origin": "llm",
+            "exploration_goal_id": candidate.get("exploration_goal_id"),
+            "feature": candidate.get("feature"),
+            "confidence": candidate.get("confidence"),
+            "origin": candidate.get("origin") or default_origin,
             "actions": candidate["actions"],
             "status": "pending",
         }
@@ -514,15 +599,7 @@ async def _expand_states_with_llm(
         accepted += 1
         results.append(_llm_expansion_result(candidate, transition))
 
-    return {
-        "status": "completed",
-        "model": model,
-        "rationale": payload.get("rationale", ""),
-        "attempted": attempted,
-        "accepted": accepted,
-        "rejected": rejected,
-        "results": results,
-    }
+    return accepted, attempted, results
 
 
 def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
@@ -532,6 +609,9 @@ def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
         "requested_parent_state_id": candidate.get("requested_parent_state_id"),
         "label": candidate.get("label"),
         "goal": candidate.get("goal"),
+        "exploration_goal_id": candidate.get("exploration_goal_id"),
+        "feature": candidate.get("feature"),
+        "confidence": candidate.get("confidence"),
         "repair_note": candidate.get("repair_note"),
         "status": transition.get("status"),
         "to": transition.get("to"),
@@ -620,12 +700,15 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
                 try:
                     await locator.click(timeout=PROBE_ACTION_TIMEOUT_MS)
                 except Exception:
-                    if not action.get("allow_hidden"):
+                    if await _click_associated_label(page, selector):
+                        pass
+                    elif not action.get("allow_hidden"):
                         raise
-                    await page.evaluate(
-                        "(selector) => document.querySelector(selector)?.click()",
-                        selector,
-                    )
+                    else:
+                        await page.evaluate(
+                            "(selector) => document.querySelector(selector)?.click()",
+                            selector,
+                        )
             elif action_type == "fill":
                 await locator.fill(action.get("value", ""), timeout=PROBE_ACTION_TIMEOUT_MS)
             elif action_type == "select":
@@ -642,6 +725,22 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
             return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     return {"status": "success"}
+
+
+async def _click_associated_label(page, selector: str) -> bool:
+    return bool(
+        await page.evaluate(
+            """(selector) => {
+                const element = document.querySelector(selector);
+                if (!element || !element.id) return false;
+                const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+                if (!label) return false;
+                label.click();
+                return true;
+            }""",
+            selector,
+        )
+    )
 
 
 def _call_openai_workflow_expander(context: dict, api_key: str, model: str) -> dict:
@@ -755,6 +854,137 @@ def _generate_llm_exploration_goals(
         }
     )
     return normalized
+
+
+async def _validate_exploration_goal_candidates(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    exploration_goals: dict,
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    max_validations: int,
+) -> dict:
+    if exploration_goals.get("status") != "completed":
+        return {
+            "status": "skipped",
+            "reason": f"Exploration goals were not completed: {exploration_goals.get('status')}",
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    candidates = _goal_validation_candidates(exploration_goals, max_validations=max_validations)
+    if not candidates:
+        return {
+            "status": "completed",
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    signatures = {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+    accepted, attempted, results = await _validate_workflow_candidates(
+        browser=browser,
+        start_url=start_url,
+        output_dir=output_dir,
+        states=states,
+        transitions=transitions,
+        viewport=viewport,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        timeout_ms=timeout_ms,
+        candidates=candidates,
+        states_by_id=states_by_id,
+        signatures=signatures,
+        default_origin="llm_goal",
+    )
+    _attach_goal_validation_results(exploration_goals, results)
+    return {
+        "status": "completed",
+        "attempted": attempted,
+        "accepted": accepted,
+        "selected_candidate_count": len(candidates),
+        "results": results,
+    }
+
+
+def _goal_validation_candidates(exploration_goals: dict, max_validations: int) -> list[dict]:
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    goals = sorted(
+        exploration_goals.get("goals", []),
+        key=lambda goal: (
+            priority_order.get(goal.get("priority"), 1),
+            goal.get("goal_id") or "",
+        ),
+    )
+    candidates = []
+    for goal in goals:
+        if goal.get("status") != "needs_validation":
+            continue
+        for workflow in goal.get("workflow_candidates", []):
+            if len(candidates) >= max(0, max_validations):
+                return candidates
+            candidates.append(
+                {
+                    "candidate_id": workflow.get("candidate_id"),
+                    "parent_state_id": workflow.get("parent_state_id"),
+                    "requested_parent_state_id": workflow.get("requested_parent_state_id"),
+                    "kind": "llm_goal_workflow",
+                    "label": workflow.get("label") or goal.get("title") or "Exploration goal workflow",
+                    "goal": goal.get("hypothesis") or goal.get("title"),
+                    "expected_outcome": goal.get("expected_outcome"),
+                    "exploration_goal_id": goal.get("goal_id"),
+                    "feature": goal.get("feature"),
+                    "confidence": workflow.get("confidence"),
+                    "repair_note": workflow.get("repair_note"),
+                    "origin": "llm_goal",
+                    "priority": 4,
+                    "bounds": {},
+                    "actions": workflow.get("actions", []),
+                }
+            )
+    return candidates
+
+
+def _attach_goal_validation_results(exploration_goals: dict, results: list[dict]) -> None:
+    results_by_id = {
+        result.get("candidate_id"): result
+        for result in results
+        if result.get("candidate_id")
+    }
+    for goal in exploration_goals.get("goals", []):
+        goal_results = []
+        for workflow in goal.get("workflow_candidates", []):
+            result = results_by_id.get(workflow.get("candidate_id"))
+            if not result:
+                continue
+            workflow["validation"] = {
+                "status": result.get("status"),
+                "state_id": result.get("to"),
+                "duplicate_of": result.get("duplicate_of"),
+                "error": result.get("error"),
+            }
+            goal_results.append(result)
+
+        if goal_results:
+            if any(result.get("status") == "success" for result in goal_results):
+                goal["status"] = "validated"
+            elif all(result.get("status") in {"action_failed", "replay_failed", "duplicate"} for result in goal_results):
+                goal["status"] = "needs_validation"
 
 
 def _call_openai_exploration_goals(context: dict, api_key: str, model: str, max_goals: int) -> dict:
@@ -1686,6 +1916,9 @@ def _path_transition(transition: dict) -> dict:
         "expected_outcome": transition.get("expected_outcome"),
         "repair_note": transition.get("repair_note"),
         "requested_parent_state_id": transition.get("requested_parent_state_id"),
+        "exploration_goal_id": transition.get("exploration_goal_id"),
+        "feature": transition.get("feature"),
+        "confidence": transition.get("confidence"),
         "duplicate_of": transition.get("duplicate_of"),
         "origin": transition.get("origin"),
         "actions": transition.get("actions", []),
@@ -1894,7 +2127,7 @@ def _candidate_path_quality_tags(transitions: list[dict]) -> list[str]:
         tags.append("submits_input")
     if "toggle" in kind_set:
         tags.append("changes_state")
-    if "llm_workflow" in kind_set:
+    if {"llm_workflow", "llm_goal_workflow"} & kind_set:
         tags.append("llm_guided_workflow")
     if {"input_submit", "toggle"}.issubset(kind_set):
         tags.append("creates_then_mutates")

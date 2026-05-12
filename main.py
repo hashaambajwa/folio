@@ -11,6 +11,7 @@ from scanner import (
     DEFAULT_PROBE_DEPTH,
     MAX_LLM_EXPANSIONS,
     MAX_LLM_EXPLORATION_GOALS,
+    MAX_LLM_GOAL_VALIDATIONS,
     run_scan,
 )
 from source_context import (
@@ -73,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ask an LLM to map app functionality and propose exploration goals without executing them",
     )
+    scan_parser.add_argument(
+        "--validate-goals",
+        action="store_true",
+        help="validate LLM exploration goal workflow candidates with Playwright and add successful paths",
+    )
     scan_parser.add_argument("--llm-model", help="OpenAI model for LLM-powered scan stages")
     scan_parser.add_argument(
         "--max-llm-expansions",
@@ -85,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_LLM_EXPLORATION_GOALS,
         type=int,
         help="maximum LLM exploration goals to keep",
+    )
+    scan_parser.add_argument(
+        "--max-goal-validations",
+        default=MAX_LLM_GOAL_VALIDATIONS,
+        type=int,
+        help="maximum exploration goal workflow candidates to validate",
     )
     scan_parser.add_argument(
         "--source-root",
@@ -220,9 +232,11 @@ def handle_scan(args: argparse.Namespace) -> int:
         source_max_file_bytes=args.source_max_file_bytes,
         llm_expand=args.llm_expand,
         llm_goals=args.llm_goals,
+        validate_goals=args.validate_goals,
         llm_model=args.llm_model,
         max_llm_expansions=args.max_llm_expansions,
         max_llm_goals=args.max_llm_goals,
+        max_goal_validations=args.max_goal_validations,
     )
 
     dom = result["dom"]
@@ -248,6 +262,13 @@ def handle_scan(args: argparse.Namespace) -> int:
             f"{exploration_goals.get('status')} "
             f"({exploration_goals.get('goal_count', 0)} goals, "
             f"{exploration_goals.get('workflow_candidate_count', 0)} workflow candidates)"
+        )
+    goal_validation = result.get("goal_validation", {})
+    if goal_validation.get("status") != "disabled":
+        print(
+            "Goal validation: "
+            f"{goal_validation.get('status')} "
+            f"({goal_validation.get('accepted', 0)}/{goal_validation.get('attempted', 0)} accepted)"
         )
     source_context = result.get("source_context")
     if source_context:

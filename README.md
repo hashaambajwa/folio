@@ -82,6 +82,12 @@ Use `--llm-goals` when you want the LLM to map the app's feature areas and propo
 python main.py scan https://example.com --llm-goals --max-llm-goals 12
 ```
 
+Use `--validate-goals` to execute those goal workflow candidates in Playwright. Successful validations are promoted into the discovered state graph and become normal `candidate_paths` for coverage planning.
+
+```bash
+python main.py scan https://example.com --validate-goals --max-goal-validations 8
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash

@@ -200,12 +200,15 @@ async def _execute_action(
             try:
                 await locator.click(timeout=action_timeout_ms)
             except Exception:
-                if not action.get("allow_hidden"):
+                if await _click_associated_label(page, action.get("selector")):
+                    pass
+                elif not action.get("allow_hidden"):
                     raise
-                await page.evaluate(
-                    "(selector) => document.querySelector(selector)?.click()",
-                    action.get("selector"),
-                )
+                else:
+                    await page.evaluate(
+                        "(selector) => document.querySelector(selector)?.click()",
+                        action.get("selector"),
+                    )
             await _wait_for_settle(page)
         elif action_type == "fill":
             locator = await _ready_locator(page, action, action_timeout_ms)
@@ -263,6 +266,24 @@ async def _center_locator_in_recording_view(page, locator, action_timeout_ms: in
         }"""
     )
     await page.wait_for_timeout(VIEWPORT_SETTLE_MS)
+
+
+async def _click_associated_label(page, selector: str | None) -> bool:
+    if not selector:
+        return False
+    return bool(
+        await page.evaluate(
+            """(selector) => {
+                const element = document.querySelector(selector);
+                if (!element || !element.id) return false;
+                const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+                if (!label) return false;
+                label.click();
+                return true;
+            }""",
+            selector,
+        )
+    )
 
 
 async def _wait_for_settle(page) -> None:

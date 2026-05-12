@@ -772,7 +772,7 @@ def _path_has_product_workflow(path: dict) -> bool:
     quality_tags = set(path.get("quality_tags", []))
     kinds = set(path.get("kinds", []))
     action_types = set(path.get("action_types", []))
-    if "llm_guided_workflow" in quality_tags or "llm_workflow" in kinds:
+    if "llm_guided_workflow" in quality_tags or {"llm_workflow", "llm_goal_workflow"} & kinds:
         return True
     if _path_looks_generic_utility(path):
         return False
