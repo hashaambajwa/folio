@@ -15,6 +15,7 @@ SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select", "navigate"}
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 DEFAULT_OBSERVE_SECONDS = 1.5
 VIEWPORT_SETTLE_MS = 250
+FIELD_ACTION_DELAY_MS = 250
 
 
 def load_plan(plan_path: str | Path) -> dict:
@@ -189,14 +190,14 @@ async def _execute_action(
     try:
         if action_type == "observe":
             if action.get("selector"):
-                await _ready_locator(page, action, action_timeout_ms)
+                await _ready_locator(page, action, action_timeout_ms, scroll_policy="observe")
             duration_seconds = min(
                 action.get("duration_seconds") or scene.get("duration_seconds", DEFAULT_OBSERVE_SECONDS),
                 4,
             )
             await page.wait_for_timeout(int(duration_seconds * 1000))
         elif action_type == "click":
-            locator = await _ready_locator(page, action, action_timeout_ms)
+            locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="minimal")
             try:
                 await locator.click(timeout=action_timeout_ms)
             except Exception:
@@ -211,15 +212,15 @@ async def _execute_action(
                     )
             await _wait_for_settle(page)
         elif action_type == "fill":
-            locator = await _ready_locator(page, action, action_timeout_ms)
+            locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="none")
             await locator.fill(action.get("value", ""), timeout=action_timeout_ms)
-            await page.wait_for_timeout(default_delay_ms)
+            await page.wait_for_timeout(min(default_delay_ms, FIELD_ACTION_DELAY_MS))
         elif action_type == "select":
-            locator = await _ready_locator(page, action, action_timeout_ms)
+            locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="none")
             await locator.select_option(value=action.get("value", ""), timeout=action_timeout_ms)
-            await page.wait_for_timeout(default_delay_ms)
+            await page.wait_for_timeout(min(default_delay_ms, FIELD_ACTION_DELAY_MS))
         elif action_type == "press":
-            locator = await _ready_locator(page, action, action_timeout_ms)
+            locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="none")
             await locator.press(action.get("key", "Enter"), timeout=action_timeout_ms)
             await _wait_for_settle(page)
         elif action_type == "navigate":
@@ -241,7 +242,7 @@ async def _execute_action(
         }
 
 
-async def _ready_locator(page, action: dict, action_timeout_ms: int):
+async def _ready_locator(page, action: dict, action_timeout_ms: int, scroll_policy: str = "minimal"):
     selector = action.get("selector")
     if not selector:
         raise ValueError("Action requires a selector")
@@ -249,50 +250,42 @@ async def _ready_locator(page, action: dict, action_timeout_ms: int):
     locator = page.locator(selector).first
     wait_state = "attached" if action.get("allow_hidden") else "visible"
     await locator.wait_for(state=wait_state, timeout=action_timeout_ms)
-    if not action.get("allow_hidden"):
-        await _center_locator_in_recording_view(page, locator, action_timeout_ms)
+    if not action.get("allow_hidden") and scroll_policy != "none":
+        await _keep_locator_in_recording_view(page, locator, scroll_policy)
     return locator
 
 
-async def _center_locator_in_recording_view(page, locator, action_timeout_ms: int) -> None:
+async def _keep_locator_in_recording_view(page, locator, scroll_policy: str) -> None:
     did_scroll = await locator.evaluate(
-        """(element) => {
+        """(element, scrollPolicy) => {
             const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
             const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-            const verticalMargin = Math.min(140, Math.max(72, viewportHeight * 0.16));
-            const horizontalMargin = 24;
 
-            const isComfortablyVisible = (rect) => (
-                rect.top >= verticalMargin &&
-                rect.bottom <= viewportHeight - verticalMargin &&
-                rect.left >= horizontalMargin &&
-                rect.right <= viewportWidth - horizontalMargin
-            );
+            const isInViewport = (rect) =>
+                rect.bottom > 0 &&
+                rect.top < viewportHeight &&
+                rect.right > 0 &&
+                rect.left < viewportWidth;
+
+            const isFullyVisible = (rect) =>
+                rect.top >= 0 &&
+                rect.bottom <= viewportHeight &&
+                rect.left >= 0 &&
+                rect.right <= viewportWidth;
 
             let rect = element.getBoundingClientRect();
-            if (isComfortablyVisible(rect)) {
+            if (scrollPolicy === "observe" && isInViewport(rect)) {
+                return false;
+            }
+            if (scrollPolicy !== "observe" && isFullyVisible(rect)) {
                 return false;
             }
 
             const startingY = window.scrollY;
             element.scrollIntoView({block: "nearest", inline: "nearest", behavior: "auto"});
-            rect = element.getBoundingClientRect();
-            if (isComfortablyVisible(rect)) {
-                return Math.abs(window.scrollY - startingY) >= 8;
-            }
-
-            const documentElement = document.documentElement;
-            const maxY = Math.max(0, documentElement.scrollHeight - viewportHeight);
-            const targetY = window.scrollY + rect.top - (viewportHeight * 0.42) + (rect.height / 2);
-            const nextY = Math.max(0, Math.min(maxY, targetY));
-
-            if (Math.abs(nextY - window.scrollY) < 8) {
-                return false;
-            }
-
-            window.scrollTo({top: nextY, behavior: "auto"});
-            return true;
-        }"""
+            return Math.abs(window.scrollY - startingY) >= 8;
+        }""",
+        scroll_policy,
     )
     if did_scroll:
         await page.wait_for_timeout(VIEWPORT_SETTLE_MS)
