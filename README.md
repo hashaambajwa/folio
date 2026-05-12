@@ -94,6 +94,16 @@ Use `--repair-goals` when validated LLM goal workflows partially execute but fai
 python main.py scan https://example.com --validate-goals --repair-goals --max-goal-repairs 4
 ```
 
+Use `--coverage-audit` after goal validation when you want the LLM to critique the validated workflow set and propose missing functionality. Audit workflow candidates are normalized against discovered selectors and must pass Playwright validation before they become `candidate_paths`.
+
+```bash
+python main.py scan https://example.com \
+  --validate-goals \
+  --repair-goals \
+  --coverage-audit \
+  --max-coverage-audit-workflows 8
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash

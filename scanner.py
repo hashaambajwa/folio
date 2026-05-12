@@ -51,6 +51,8 @@ MAX_LLM_GOAL_STATES = 16
 MAX_LLM_GOAL_VALIDATIONS = 8
 MAX_LLM_GOAL_REPAIRS = 4
 MAX_LLM_GOAL_REPAIR_CANDIDATES = 2
+MAX_LLM_COVERAGE_AUDIT_WORKFLOWS = 8
+MAX_LLM_COVERAGE_AUDIT_FEATURES = 16
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
@@ -112,11 +114,13 @@ async def scan(
     llm_goals: bool = False,
     validate_goals: bool = False,
     repair_goals: bool = False,
+    coverage_audit: bool = False,
     llm_model: str | None = None,
     max_llm_expansions: int = MAX_LLM_EXPANSIONS,
     max_llm_goals: int = MAX_LLM_EXPLORATION_GOALS,
     max_goal_validations: int = MAX_LLM_GOAL_VALIDATIONS,
     max_goal_repairs: int = MAX_LLM_GOAL_REPAIRS,
+    max_coverage_audit_workflows: int = MAX_LLM_COVERAGE_AUDIT_WORKFLOWS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -133,6 +137,7 @@ async def scan(
     llm_expansion: dict = {"status": "disabled"}
     exploration_goals: dict = {"status": "disabled"}
     goal_validation: dict = {"status": "disabled"}
+    coverage_audit_result: dict = {"status": "disabled"}
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -207,7 +212,7 @@ async def scan(
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
 
-            if llm_goals or validate_goals or repair_goals:
+            if llm_goals or validate_goals or repair_goals or coverage_audit:
                 exploration_goals = _generate_llm_exploration_goals(
                     start_url=final_url,
                     states=states,
@@ -252,6 +257,27 @@ async def scan(
                     goal_validation["total_attempted"] = goal_validation.get("attempted", 0) + repairs.get("attempted", 0)
                     goal_validation["total_accepted"] = goal_validation.get("accepted", 0) + repairs.get("accepted", 0)
                 candidate_paths = _candidate_paths_for_states(final_url, states)
+
+            if coverage_audit:
+                candidate_paths = _candidate_paths_for_states(final_url, states)
+                coverage_audit_result = await _audit_coverage_with_llm(
+                    browser=browser,
+                    start_url=final_url,
+                    output_dir=output_dir,
+                    states=states,
+                    transitions=transitions,
+                    candidate_paths=candidate_paths,
+                    exploration_goals=exploration_goals,
+                    goal_validation=goal_validation,
+                    viewport=viewport,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    timeout_ms=timeout_ms,
+                    source_context=source_context,
+                    model=llm_model,
+                    max_workflows=max_coverage_audit_workflows,
+                )
+                candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
             await browser.close()
@@ -272,11 +298,13 @@ async def scan(
             "llm_goals": llm_goals,
             "validate_goals": validate_goals,
             "repair_goals": repair_goals,
+            "coverage_audit": coverage_audit,
             "llm_model": llm_model,
             "max_llm_expansions": max_llm_expansions,
             "max_llm_goals": max_llm_goals,
             "max_goal_validations": max_goal_validations,
             "max_goal_repairs": max_goal_repairs,
+            "max_coverage_audit_workflows": max_coverage_audit_workflows,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -310,6 +338,7 @@ async def scan(
         "llm_expansion": llm_expansion,
         "exploration_goals": exploration_goals,
         "goal_validation": goal_validation,
+        "coverage_audit": coverage_audit_result,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -582,6 +611,7 @@ async def _validate_workflow_candidates(
             "requested_parent_state_id": candidate.get("requested_parent_state_id"),
             "exploration_goal_id": candidate.get("exploration_goal_id"),
             "feature": candidate.get("feature"),
+            "feature_id": candidate.get("feature_id"),
             "confidence": candidate.get("confidence"),
             "repaired_from": candidate.get("repaired_from"),
             "origin": candidate.get("origin") or default_origin,
@@ -658,6 +688,7 @@ def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
         "goal": candidate.get("goal"),
         "exploration_goal_id": candidate.get("exploration_goal_id"),
         "feature": candidate.get("feature"),
+        "feature_id": candidate.get("feature_id"),
         "confidence": candidate.get("confidence"),
         "repaired_from": candidate.get("repaired_from"),
         "repair_note": candidate.get("repair_note"),
@@ -714,8 +745,11 @@ async def _run_probe_candidate(
     _attach_page_listeners(page, console_errors, page_errors)
 
     try:
-        await page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        await _wait_for_settle(page)
+        try:
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await _wait_for_settle(page)
+        except Exception as exc:
+            return {"status": "navigation_failed", "error": f"{type(exc).__name__}: {exc}"}
 
         replay_result = await _execute_probe_actions(page, parent_state.get("replay_actions", []))
         if replay_result["status"] != "success":
@@ -1471,6 +1505,290 @@ def _append_goal_repair_workflows(exploration_goals: dict, repair_candidates: li
     )
 
 
+async def _audit_coverage_with_llm(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    candidate_paths: list[dict],
+    exploration_goals: dict,
+    goal_validation: dict,
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    source_context: dict | None,
+    model: str | None,
+    max_workflows: int,
+) -> dict:
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "skipped",
+            "reason": "Missing OPENAI_API_KEY.",
+            "model": model,
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    try:
+        payload = _call_openai_coverage_audit(
+            _coverage_audit_context(
+                start_url=start_url,
+                states=states,
+                candidate_paths=candidate_paths,
+                exploration_goals=exploration_goals,
+                goal_validation=goal_validation,
+                source_context=source_context,
+                max_workflows=max_workflows,
+            ),
+            api_key=api_key,
+            model=model,
+            max_workflows=max_workflows,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "model": model,
+            "error": f"{type(exc).__name__}: {exc}",
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    signatures = {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+    normalized = _normalize_coverage_audit_payload(
+        payload=payload,
+        states_by_id=states_by_id,
+        candidate_paths=candidate_paths,
+        max_workflows=max_workflows,
+    )
+    candidates = normalized.pop("workflow_candidates", [])
+    if not candidates:
+        normalized.update(
+            {
+                "status": "completed",
+                "model": model,
+                "attempted": 0,
+                "accepted": 0,
+                "selected_candidate_count": 0,
+                "results": [],
+            }
+        )
+        return normalized
+
+    accepted, attempted, results = await _validate_workflow_candidates(
+        browser=browser,
+        start_url=start_url,
+        output_dir=output_dir,
+        states=states,
+        transitions=transitions,
+        viewport=viewport,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        timeout_ms=timeout_ms,
+        candidates=candidates,
+        states_by_id=states_by_id,
+        signatures=signatures,
+        default_origin="llm_coverage_audit",
+    )
+    normalized.update(
+        {
+            "status": "completed",
+            "model": model,
+            "attempted": attempted,
+            "accepted": accepted,
+            "selected_candidate_count": len(candidates),
+            "results": results,
+        }
+    )
+    _resolve_audited_missing_features(normalized, results)
+    return normalized
+
+
+def _normalize_coverage_audit_payload(
+    payload: dict,
+    states_by_id: dict[str, dict],
+    candidate_paths: list[dict],
+    max_workflows: int,
+) -> dict:
+    known_path_ids = {
+        path.get("path_id")
+        for path in candidate_paths
+        if path.get("path_id")
+    }
+    covered_features = [
+        {
+            "feature_id": _slug(feature.get("feature_id") or feature.get("title") or "covered-feature"),
+            "title": _clean_label(feature.get("title") or "Covered feature"),
+            "confidence": _enum_value(feature.get("confidence"), {"high", "medium", "low"}, "medium"),
+            "evidence": _clean_string_list(feature.get("evidence"), limit=6),
+            "related_path_ids": [
+                path_id
+                for path_id in _clean_string_list(feature.get("related_path_ids"), limit=8)
+                if path_id in known_path_ids
+            ],
+        }
+        for feature in payload.get("covered_features", [])[:MAX_LLM_COVERAGE_AUDIT_FEATURES]
+    ]
+    missing_features = [
+        {
+            "feature_id": _slug(feature.get("feature_id") or feature.get("title") or "missing-feature"),
+            "title": _clean_label(feature.get("title") or "Missing feature"),
+            "priority": _enum_value(feature.get("priority"), {"high", "medium", "low"}, "medium"),
+            "reason": _clean_label(feature.get("reason") or ""),
+            "blockers": _clean_string_list(feature.get("blockers"), limit=6),
+            "evidence": _clean_string_list(feature.get("evidence"), limit=6),
+        }
+        for feature in payload.get("missing_features", [])[:MAX_LLM_COVERAGE_AUDIT_FEATURES]
+    ]
+    low_value_paths = [
+        {
+            "path_id": path.get("path_id"),
+            "reason": _clean_label(path.get("reason") or ""),
+        }
+        for path in payload.get("low_value_paths", [])[:MAX_CANDIDATE_PATHS]
+        if path.get("path_id") in known_path_ids
+    ]
+    candidates, rejected = _normalize_coverage_audit_workflow_candidates(
+        payload=payload,
+        states_by_id=states_by_id,
+        max_workflows=max_workflows,
+    )
+    return {
+        "rationale": _clean_label(payload.get("rationale") or ""),
+        "app_coverage_summary": _clean_label(payload.get("app_coverage_summary") or ""),
+        "covered_features": covered_features,
+        "missing_features": missing_features,
+        "low_value_paths": low_value_paths,
+        "workflow_candidates": candidates,
+        "rejected_workflow_candidates": rejected,
+    }
+
+
+def _normalize_coverage_audit_workflow_candidates(
+    payload: dict,
+    states_by_id: dict[str, dict],
+    max_workflows: int,
+) -> tuple[list[dict], list[dict]]:
+    candidates = []
+    rejected = []
+    for index, raw_candidate in enumerate(payload.get("workflow_candidates", [])[:max(0, max_workflows)], 1):
+        requested_parent_state_id = raw_candidate.get("parent_state_id")
+        parent_state = states_by_id.get(requested_parent_state_id)
+        repair_note = None
+        drop_unavailable = False
+        if not parent_state:
+            parent_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+            drop_unavailable = bool(parent_state)
+        elif _workflow_has_unavailable_selectors(raw_candidate, parent_state):
+            repaired_state, repair_note = _best_state_for_llm_workflow(raw_candidate, states_by_id)
+            if repaired_state and repaired_state.get("state_id") != parent_state.get("state_id"):
+                parent_state = repaired_state
+                drop_unavailable = True
+
+        if not parent_state:
+            rejected.append(
+                {
+                    "label": raw_candidate.get("label"),
+                    "feature_id": raw_candidate.get("feature_id"),
+                    "reason": "Unknown parent_state_id and no alternate state had enough selector coverage.",
+                }
+            )
+            continue
+
+        actions, errors = _normalize_llm_workflow_actions(
+            raw_candidate,
+            parent_state,
+            drop_unavailable=drop_unavailable,
+        )
+        if errors:
+            rejected.append(
+                {
+                    "label": raw_candidate.get("label"),
+                    "feature_id": raw_candidate.get("feature_id"),
+                    "parent_state_id": requested_parent_state_id,
+                    "reason": "; ".join(errors),
+                }
+            )
+            continue
+        if not _is_meaningful_workflow(actions):
+            rejected.append(
+                {
+                    "label": raw_candidate.get("label"),
+                    "feature_id": raw_candidate.get("feature_id"),
+                    "parent_state_id": requested_parent_state_id,
+                    "reason": "Workflow candidate must include fill/select and click/press actions.",
+                }
+            )
+            continue
+
+        feature_id = _slug(raw_candidate.get("feature_id") or raw_candidate.get("feature") or raw_candidate.get("label") or "coverage")
+        label = _clean_label(raw_candidate.get("label") or f"Coverage audit workflow {index}")
+        parent_state_id = parent_state.get("state_id")
+        candidates.append(
+            {
+                "candidate_id": f"coverage-audit:{feature_id}:{parent_state_id}:{_slug(label)}",
+                "parent_state_id": parent_state_id,
+                "requested_parent_state_id": requested_parent_state_id,
+                "kind": "llm_goal_workflow",
+                "label": label,
+                "goal": _clean_label(raw_candidate.get("goal") or raw_candidate.get("expected_outcome") or label),
+                "expected_outcome": _clean_label(raw_candidate.get("expected_outcome") or ""),
+                "feature_id": feature_id,
+                "feature": _clean_label(raw_candidate.get("feature") or raw_candidate.get("feature_id") or feature_id),
+                "confidence": _enum_value(raw_candidate.get("confidence"), {"high", "medium", "low"}, "medium"),
+                "repair_note": repair_note or "Proposed by coverage audit for missing or under-covered functionality.",
+                "origin": "llm_coverage_audit",
+                "priority": 5,
+                "bounds": {},
+                "actions": actions,
+            }
+        )
+
+    return candidates, rejected
+
+
+def _resolve_audited_missing_features(audit: dict, results: list[dict]) -> None:
+    accepted_by_feature_id = {
+        result.get("feature_id"): result
+        for result in results
+        if result.get("status") == "success" and result.get("feature_id")
+    }
+    if not accepted_by_feature_id:
+        return
+
+    remaining = []
+    resolved = audit.setdefault("resolved_missing_features", [])
+    for feature in audit.get("missing_features", []):
+        result = accepted_by_feature_id.get(feature.get("feature_id"))
+        if not result:
+            remaining.append(feature)
+            continue
+        resolved.append(
+            {
+                **feature,
+                "status": "validated_by_audit",
+                "candidate_id": result.get("candidate_id"),
+                "state_id": result.get("to"),
+            }
+        )
+
+    audit["missing_features"] = remaining
+
+
 def _goal_validation_candidates(exploration_goals: dict, max_validations: int) -> list[dict]:
     priority_order = {"high": 0, "medium": 1, "low": 2}
     goals = sorted(
@@ -1572,7 +1890,7 @@ def _call_openai_exploration_goals(context: dict, api_key: str, model: str, max_
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=75, context=_https_context()) as response:
+        with urllib.request.urlopen(request, timeout=180, context=_https_context()) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1641,7 +1959,55 @@ def _call_openai_goal_repair(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=75, context=_https_context()) as response:
+        with urllib.request.urlopen(request, timeout=180, context=_https_context()) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
+def _call_openai_coverage_audit(context: dict, api_key: str, model: str, max_workflows: int) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_coverage_audit_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(context, indent=2),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_coverage_audit",
+                "strict": True,
+                "schema": _llm_coverage_audit_schema(max_workflows),
+            }
+        },
+        "max_output_tokens": 8_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180, context=_https_context()) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1739,6 +2105,27 @@ def _llm_goal_repair_prompt() -> str:
     )
 
 
+def _llm_coverage_audit_prompt() -> str:
+    return (
+        "You are Folio's coverage auditor. Review the app summary, discovered states, validated candidate paths, "
+        "goal validation results, and source hints. Decide what meaningful product functionality is already covered, "
+        "what is still missing or under-covered, and which existing paths are low-value navigation or site chrome. "
+        "Propose only safe, bounded workflows that address missing core product functionality and can replay from one "
+        "of the provided state_id values using selectors present in that state. Prefer workflows that calculate, create, "
+        "transform, filter, preview, export, save locally, or otherwise produce visible in-app outcomes. Avoid feedback, "
+        "contact, account, payment, destructive, legal, header, footer, generic search, and external navigation unless "
+        "the scanned app is specifically about that function. Do not duplicate already validated workflows unless the "
+        "new workflow covers a meaningfully different mode, input type, branch, or result surface. If an important "
+        "feature has usable selectors, propose a workflow for it until max_workflow_candidates is reached; do not stop "
+        "after only two or three workflows when more safe product features are reachable. If an important feature cannot "
+        "be safely reached with the current selectors, report it as a missing feature with blockers instead of inventing "
+        "selectors. Every high- or medium-priority missing_features item with empty blockers must have at least one "
+        "workflow_candidates item using the same feature_id. If no safe candidate can be created, keep the feature in "
+        "missing_features but include concrete blockers. Folio will validate every workflow candidate in Playwright before using it. "
+        "Return only JSON matching the schema."
+    )
+
+
 def _workflow_expansion_context(
     start_url: str,
     states: list[dict],
@@ -1793,32 +2180,203 @@ def _exploration_goal_context(
         },
         "source_context": _source_context_for_expander(source_context),
         "candidate_paths": [
-            {
-                "path_id": path.get("path_id"),
-                "score": path.get("score"),
-                "labels": path.get("labels", []),
-                "kinds": path.get("kinds", []),
-                "quality_tags": path.get("quality_tags", []),
-                "action_types": path.get("action_types", []),
-                "final_state_id": path.get("final_state_id"),
-                "final_url": path.get("final_url"),
-                "selection_reasons": path.get("selection_reasons", []),
-                "transition_outcomes": [
-                    {
-                        "label": transition.get("label"),
-                        "kind": transition.get("kind"),
-                        "goal": transition.get("goal"),
-                        "expected_outcome": transition.get("expected_outcome"),
-                        "outcome_summary": transition.get("outcome_summary"),
-                    }
-                    for transition in path.get("transitions", [])
-                ],
-            }
+            _candidate_path_for_audit(path)
             for path in candidate_paths[:MAX_CANDIDATE_PATHS]
         ],
         "states": [
-            _state_for_expander(state)
+            _state_for_goal_generation(state)
             for state in states[:MAX_LLM_GOAL_STATES]
+        ],
+    }
+
+
+def _coverage_audit_context(
+    start_url: str,
+    states: list[dict],
+    candidate_paths: list[dict],
+    exploration_goals: dict,
+    goal_validation: dict,
+    source_context: dict | None,
+    max_workflows: int,
+) -> dict:
+    return {
+        "start_url": start_url,
+        "goal": "Audit validated app-functionality coverage and propose only missing, high-value workflows.",
+        "limits": {
+            "max_workflow_candidates": max_workflows,
+            "supported_actions": ["observe", "click", "fill", "press", "select"],
+        },
+        "source_context": _source_context_for_expander(source_context),
+        "exploration_goals": _exploration_goals_for_audit(exploration_goals),
+        "goal_validation": _goal_validation_for_audit(goal_validation),
+        "candidate_paths": [
+            _candidate_path_for_audit(path)
+            for path in candidate_paths[:MAX_CANDIDATE_PATHS]
+        ],
+        "states": [
+            _state_for_audit(state)
+            for state in states[:MAX_LLM_EXPANSION_STATES]
+        ],
+    }
+
+
+def _exploration_goals_for_audit(exploration_goals: dict) -> dict:
+    if exploration_goals.get("status") == "disabled":
+        return {"status": "disabled"}
+
+    return {
+        "status": exploration_goals.get("status"),
+        "app_summary": exploration_goals.get("app_summary"),
+        "feature_areas": [
+            {
+                "feature_id": feature.get("feature_id"),
+                "title": feature.get("title"),
+                "validation_status": feature.get("validation_status"),
+                "evidence": feature.get("evidence", []),
+                "related_path_ids": feature.get("related_path_ids", []),
+            }
+            for feature in exploration_goals.get("feature_areas", [])[:MAX_LLM_COVERAGE_AUDIT_FEATURES]
+        ],
+        "goals": [
+            {
+                "goal_id": goal.get("goal_id"),
+                "title": goal.get("title"),
+                "feature": goal.get("feature"),
+                "priority": goal.get("priority"),
+                "status": goal.get("status"),
+                "expected_outcome": goal.get("expected_outcome"),
+                "workflow_candidates": [
+                    {
+                        "candidate_id": workflow.get("candidate_id"),
+                        "label": workflow.get("label"),
+                        "parent_state_id": workflow.get("parent_state_id"),
+                        "validation": _compact_validation_for_audit(workflow.get("validation", {})),
+                    }
+                    for workflow in goal.get("workflow_candidates", [])[:MAX_LLM_GOAL_WORKFLOWS + MAX_LLM_GOAL_REPAIR_CANDIDATES]
+                ],
+                "blockers": goal.get("blockers", []),
+            }
+            for goal in exploration_goals.get("goals", [])[:MAX_LLM_COVERAGE_AUDIT_FEATURES]
+        ],
+        "deprioritized_goals": exploration_goals.get("deprioritized_goals", []),
+        "rejected_workflow_candidates": exploration_goals.get("rejected_workflow_candidates", [])[:20],
+    }
+
+
+def _goal_validation_for_audit(goal_validation: dict) -> dict:
+    if goal_validation.get("status") == "disabled":
+        return {"status": "disabled"}
+
+    return {
+        "status": goal_validation.get("status"),
+        "attempted": goal_validation.get("attempted", 0),
+        "accepted": goal_validation.get("accepted", 0),
+        "results": [
+            _validation_result_for_audit(result)
+            for result in goal_validation.get("results", [])[:20]
+        ],
+        "repairs": {
+            "status": (goal_validation.get("repairs") or {}).get("status"),
+            "attempted": (goal_validation.get("repairs") or {}).get("attempted", 0),
+            "accepted": (goal_validation.get("repairs") or {}).get("accepted", 0),
+            "results": [
+                _validation_result_for_audit(result)
+                for result in (goal_validation.get("repairs") or {}).get("results", [])[:12]
+            ],
+        },
+    }
+
+
+def _validation_result_for_audit(result: dict) -> dict:
+    return {
+        "candidate_id": result.get("candidate_id"),
+        "label": result.get("label"),
+        "goal": result.get("goal"),
+        "feature": result.get("feature"),
+        "status": result.get("status"),
+        "to": result.get("to"),
+        "duplicate_of": result.get("duplicate_of"),
+        "error": _truncate_text(result.get("error"), limit=320),
+    }
+
+
+def _compact_validation_for_audit(validation: dict) -> dict:
+    if not validation:
+        return {}
+
+    return {
+        "status": validation.get("status"),
+        "state_id": validation.get("state_id"),
+        "duplicate_of": validation.get("duplicate_of"),
+        "error": _truncate_text(validation.get("error"), limit=320),
+    }
+
+
+def _candidate_path_for_audit(path: dict) -> dict:
+    return {
+        "path_id": path.get("path_id"),
+        "score": path.get("score"),
+        "labels": path.get("labels", []),
+        "kinds": path.get("kinds", []),
+        "quality_tags": path.get("quality_tags", []),
+        "action_types": path.get("action_types", []),
+        "final_state_id": path.get("final_state_id"),
+        "final_url": path.get("final_url"),
+        "selection_reasons": path.get("selection_reasons", [])[:4],
+        "transition_outcomes": [
+            {
+                "label": transition.get("label"),
+                "kind": transition.get("kind"),
+                "origin": transition.get("origin"),
+                "goal": _truncate_text(transition.get("goal"), limit=180),
+                "expected_outcome": _truncate_text(transition.get("expected_outcome"), limit=180),
+                "feature": transition.get("feature"),
+                "outcome_summary": _outcome_summary_for_audit(transition.get("outcome_summary")),
+            }
+            for transition in path.get("transitions", [])
+        ],
+        "final_state_summary": _state_summary_for_audit(path.get("final_state_summary", {})),
+    }
+
+
+def _outcome_summary_for_audit(outcome_summary: dict | None) -> dict | None:
+    if not outcome_summary:
+        return None
+
+    return {
+        "url_changed": outcome_summary.get("url_changed"),
+        "added_text": outcome_summary.get("added_text", [])[:6],
+        "removed_text": outcome_summary.get("removed_text", [])[:3],
+        "added_controls": outcome_summary.get("added_controls", [])[:6],
+        "removed_controls": outcome_summary.get("removed_controls", [])[:3],
+        "changed_controls": [
+            {
+                "name": control.get("name"),
+                "selectors": control.get("selectors", [])[:1],
+                "changes": control.get("changes", {}),
+            }
+            for control in outcome_summary.get("changed_controls", [])[:6]
+        ],
+        "counts": outcome_summary.get("counts", {}),
+    }
+
+
+def _state_summary_for_audit(summary: dict) -> dict:
+    return {
+        "title": summary.get("title"),
+        "text_blocks": summary.get("text_blocks", [])[:8],
+        "headings": summary.get("headings", [])[:4],
+        "interactive": [
+            {
+                "name": item.get("name"),
+                "tag": item.get("tag"),
+                "type": item.get("type"),
+                "role": item.get("role"),
+                "selectors": item.get("selectors", [])[:1],
+                "checked": item.get("checked"),
+                "disabled": item.get("disabled"),
+            }
+            for item in summary.get("interactive", [])[:10]
         ],
     }
 
@@ -1861,6 +2419,74 @@ def _state_for_expander(state: dict) -> dict:
             }
             for form in dom.get("forms", [])[:8]
         ],
+    }
+
+
+def _state_for_goal_generation(state: dict) -> dict:
+    dom = state.get("dom", {})
+    return {
+        "state_id": state.get("state_id"),
+        "title": state.get("title"),
+        "url": state.get("url"),
+        "depth": state.get("depth"),
+        "parent_state_id": state.get("parent_state_id"),
+        "replay_actions": state.get("replay_actions", []),
+        "text_blocks": dom.get("text_blocks", [])[:24],
+        "headings": dom.get("headings", [])[:10],
+        "interactive": [
+            _element_for_audit(element, index)
+            for index, element in enumerate(dom.get("interactive", [])[:60], 1)
+        ],
+        "forms": [],
+    }
+
+
+def _state_for_audit(state: dict) -> dict:
+    dom = state.get("dom", {})
+    return {
+        "state_id": state.get("state_id"),
+        "title": state.get("title"),
+        "url": state.get("url"),
+        "depth": state.get("depth"),
+        "parent_state_id": state.get("parent_state_id"),
+        "text_blocks": dom.get("text_blocks", [])[:8],
+        "headings": dom.get("headings", [])[:4],
+        "interactive": [
+            _element_for_audit(element, index)
+            for index, element in enumerate(dom.get("interactive", [])[:18], 1)
+        ],
+        "forms": [
+            {
+                "selectors": form.get("selectors", [])[:1],
+                "fields": [
+                    _element_for_audit(field, field_index)
+                    for field_index, field in enumerate(form.get("fields", [])[:10], 1)
+                ],
+            }
+            for form in dom.get("forms", [])[:3]
+        ],
+    }
+
+
+def _element_for_audit(element: dict, index: int) -> dict:
+    attrs = element.get("attributes", {})
+    return {
+        "index": index,
+        "name": _truncate_text(_element_name(element), limit=90),
+        "tag": element.get("tag"),
+        "type": element.get("type"),
+        "role": element.get("role"),
+        "text": _truncate_text(element.get("text"), limit=90),
+        "href": element.get("href"),
+        "selectors": element.get("selectors", [])[:2],
+        "attributes": {
+            "id": attrs.get("id"),
+            "placeholder": attrs.get("placeholder"),
+            "checked": attrs.get("checked"),
+            "disabled": attrs.get("disabled"),
+            "readonly": attrs.get("readonly"),
+            "aria_label": attrs.get("aria_label"),
+        },
     }
 
 
@@ -2120,6 +2746,132 @@ def _llm_goal_repair_schema() -> dict:
                 },
             },
             "abandoned_reason": {"type": "string"},
+        },
+    }
+
+
+def _llm_coverage_audit_schema(max_workflows: int) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "rationale",
+            "app_coverage_summary",
+            "covered_features",
+            "missing_features",
+            "low_value_paths",
+            "workflow_candidates",
+        ],
+        "properties": {
+            "rationale": {"type": "string"},
+            "app_coverage_summary": {"type": "string"},
+            "covered_features": {
+                "type": "array",
+                "maxItems": MAX_LLM_COVERAGE_AUDIT_FEATURES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["feature_id", "title", "confidence", "evidence", "related_path_ids"],
+                    "properties": {
+                        "feature_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                        "related_path_ids": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "missing_features": {
+                "type": "array",
+                "maxItems": MAX_LLM_COVERAGE_AUDIT_FEATURES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["feature_id", "title", "priority", "reason", "evidence", "blockers"],
+                    "properties": {
+                        "feature_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "reason": {"type": "string"},
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                        "blockers": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "low_value_paths": {
+                "type": "array",
+                "maxItems": MAX_CANDIDATE_PATHS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path_id", "reason"],
+                    "properties": {
+                        "path_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "workflow_candidates": {
+                "type": "array",
+                "maxItems": max(0, max_workflows),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "feature_id",
+                        "feature",
+                        "parent_state_id",
+                        "label",
+                        "goal",
+                        "expected_outcome",
+                        "confidence",
+                        "actions",
+                    ],
+                    "properties": {
+                        "feature_id": {"type": "string"},
+                        "feature": {"type": "string"},
+                        "parent_state_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "expected_outcome": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_LLM_EXPANSION_ACTIONS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "description": {"type": "string"},
+                                    "selector": {"type": ["string", "null"]},
+                                    "value": {"type": ["string", "null"]},
+                                    "key": {"type": ["string", "null"]},
+                                    "allow_hidden": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
         },
     }
 
@@ -2494,7 +3246,7 @@ def _click_action_is_risky(element: dict, state: dict) -> bool:
         return True
     href = element.get("href")
     state_url = state.get("url")
-    return bool(href and state_url and not _is_same_origin_url(href, state_url))
+    return bool(href and state_url and not _is_same_app_scope_url(href, state_url))
 
 
 def _is_meaningful_workflow(actions: list[dict]) -> bool:
@@ -2512,6 +3264,15 @@ def _rejected_llm_candidate(candidate: dict, reason: str) -> dict:
 
 def _clean_label(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _truncate_text(value: object, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = _clean_label(str(value))
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
 
 
 async def _wait_for_settle(page) -> None:
@@ -2641,6 +3402,7 @@ def _path_transition(transition: dict) -> dict:
         "requested_parent_state_id": transition.get("requested_parent_state_id"),
         "exploration_goal_id": transition.get("exploration_goal_id"),
         "feature": transition.get("feature"),
+        "feature_id": transition.get("feature_id"),
         "confidence": transition.get("confidence"),
         "repaired_from": transition.get("repaired_from"),
         "duplicate_of": transition.get("duplicate_of"),
@@ -2986,7 +3748,7 @@ def _is_safe_click(element: dict, start_url: str) -> bool:
     role = (element.get("role") or "").lower()
     href = element.get("href")
     if href:
-        return _is_same_origin(href, start_url)
+        return _is_same_app_scope_url(href, start_url)
 
     return tag == "button" or role in {"button", "tab", "menuitem", "option"}
 
@@ -3003,6 +3765,25 @@ def _has_risk_word(label: str) -> bool:
 
 def _is_same_origin(href: str, start_url: str) -> bool:
     return _is_same_origin_url(href, start_url)
+
+
+def _is_same_app_scope_url(left: str | None, right: str | None) -> bool:
+    if not _is_same_origin_url(left, right):
+        return False
+
+    left_path = urlparse(left or "").path or "/"
+    prefix = _app_path_prefix(right or "")
+    return left_path.startswith(prefix)
+
+
+def _app_path_prefix(url: str) -> str:
+    path = urlparse(url or "").path or "/"
+    if path == "/":
+        return "/"
+    if path.endswith("/"):
+        return path
+    directory = path.rsplit("/", 1)[0]
+    return f"{directory}/" if directory else "/"
 
 
 def _is_same_origin_url(left: str | None, right: str | None) -> bool:

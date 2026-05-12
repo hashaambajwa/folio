@@ -9,6 +9,7 @@ from scanner import (
     DEFAULT_MAX_ACTIONS_PER_STATE,
     DEFAULT_MAX_STATES,
     DEFAULT_PROBE_DEPTH,
+    MAX_LLM_COVERAGE_AUDIT_WORKFLOWS,
     MAX_LLM_EXPANSIONS,
     MAX_LLM_EXPLORATION_GOALS,
     MAX_LLM_GOAL_REPAIRS,
@@ -85,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="repair failed LLM goal workflows with failure DOM/screenshots, then re-validate them",
     )
+    scan_parser.add_argument(
+        "--coverage-audit",
+        action="store_true",
+        help="ask an LLM to audit validated coverage and propose missing workflows for Playwright validation",
+    )
     scan_parser.add_argument("--llm-model", help="OpenAI model for LLM-powered scan stages")
     scan_parser.add_argument(
         "--max-llm-expansions",
@@ -109,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_LLM_GOAL_REPAIRS,
         type=int,
         help="maximum failed exploration goal workflows to ask the LLM to repair",
+    )
+    scan_parser.add_argument(
+        "--max-coverage-audit-workflows",
+        default=MAX_LLM_COVERAGE_AUDIT_WORKFLOWS,
+        type=int,
+        help="maximum coverage-audit workflow candidates to validate",
     )
     scan_parser.add_argument(
         "--source-root",
@@ -246,11 +258,13 @@ def handle_scan(args: argparse.Namespace) -> int:
         llm_goals=args.llm_goals,
         validate_goals=args.validate_goals,
         repair_goals=args.repair_goals,
+        coverage_audit=args.coverage_audit,
         llm_model=args.llm_model,
         max_llm_expansions=args.max_llm_expansions,
         max_llm_goals=args.max_llm_goals,
         max_goal_validations=args.max_goal_validations,
         max_goal_repairs=args.max_goal_repairs,
+        max_coverage_audit_workflows=args.max_coverage_audit_workflows,
     )
 
     dom = result["dom"]
@@ -293,6 +307,14 @@ def handle_scan(args: argparse.Namespace) -> int:
                 f"{repairs.get('status')} "
                 f"({repairs.get('accepted', 0)}/{repairs.get('attempted', 0)} accepted)"
             )
+    coverage_audit = result.get("coverage_audit", {})
+    if coverage_audit.get("status") != "disabled":
+        print(
+            "Coverage audit: "
+            f"{coverage_audit.get('status')} "
+            f"({coverage_audit.get('accepted', 0)}/{coverage_audit.get('attempted', 0)} accepted, "
+            f"{len(coverage_audit.get('missing_features', []))} missing features)"
+        )
     source_context = result.get("source_context")
     if source_context:
         summary = source_context.get("summary", {})
