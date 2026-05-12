@@ -255,17 +255,47 @@ async def _ready_locator(page, action: dict, action_timeout_ms: int):
 
 
 async def _center_locator_in_recording_view(page, locator, action_timeout_ms: int) -> None:
-    await locator.scroll_into_view_if_needed(timeout=action_timeout_ms)
-    await locator.evaluate(
+    did_scroll = await locator.evaluate(
         """(element) => {
-            element.scrollIntoView({
-                block: "center",
-                inline: "center",
-                behavior: "instant"
-            });
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+            const verticalMargin = Math.min(140, Math.max(72, viewportHeight * 0.16));
+            const horizontalMargin = 24;
+
+            const isComfortablyVisible = (rect) => (
+                rect.top >= verticalMargin &&
+                rect.bottom <= viewportHeight - verticalMargin &&
+                rect.left >= horizontalMargin &&
+                rect.right <= viewportWidth - horizontalMargin
+            );
+
+            let rect = element.getBoundingClientRect();
+            if (isComfortablyVisible(rect)) {
+                return false;
+            }
+
+            const startingY = window.scrollY;
+            element.scrollIntoView({block: "nearest", inline: "nearest", behavior: "auto"});
+            rect = element.getBoundingClientRect();
+            if (isComfortablyVisible(rect)) {
+                return Math.abs(window.scrollY - startingY) >= 8;
+            }
+
+            const documentElement = document.documentElement;
+            const maxY = Math.max(0, documentElement.scrollHeight - viewportHeight);
+            const targetY = window.scrollY + rect.top - (viewportHeight * 0.42) + (rect.height / 2);
+            const nextY = Math.max(0, Math.min(maxY, targetY));
+
+            if (Math.abs(nextY - window.scrollY) < 8) {
+                return false;
+            }
+
+            window.scrollTo({top: nextY, behavior: "auto"});
+            return true;
         }"""
     )
-    await page.wait_for_timeout(VIEWPORT_SETTLE_MS)
+    if did_scroll:
+        await page.wait_for_timeout(VIEWPORT_SETTLE_MS)
 
 
 async def _click_associated_label(page, selector: str | None) -> bool:

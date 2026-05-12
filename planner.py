@@ -54,6 +54,12 @@ OUTCOME_FOCUS_TERMS = (
     "summary",
     "total",
 )
+PRODUCT_TRANSITION_KINDS = {
+    "input_submit",
+    "llm_goal_workflow",
+    "llm_workflow",
+    "toggle",
+}
 
 
 def load_scan(scan_path: str | Path) -> dict:
@@ -104,6 +110,7 @@ def _build_heuristic_plan(
         "coverage": coverage,
         "notes": [
             "Heuristic coverage plan generated from scanner-tested candidate paths.",
+            "Presentation scenes group workflows by app surface and avoid replaying repeated navigation prefixes.",
             "LLM planner should replace or refine these scenes before production use.",
         ],
     }
@@ -231,6 +238,7 @@ def _build_llm_plan(
                     "notes": [
                         "LLM ranked scanner-tested candidate paths; Folio selected every validated workflow needed for feature coverage.",
                         "Folio used canonical replay actions from selected paths.",
+                        "Presentation scenes group workflows by app surface and avoid replaying repeated navigation prefixes.",
                         "Review coverage.uncovered_features and coverage.missing_workflows to drive deeper exploration.",
                     ],
                     "selected_path_id": coverage["selected_path_ids"][0],
@@ -697,6 +705,15 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         for feature_id, feature in uncovered_features_by_id.items()
         if feature_id not in covered_feature_ids
     ]
+    if selected_path_ids:
+        paths_by_id = {path.get("path_id"): path for path in paths if path.get("path_id")}
+        selected_path_ids = _presentation_ordered_path_ids(
+            selected_path_ids,
+            paths_by_id,
+            _recording_start_url(scan),
+        )
+        selected_order = {path_id: index for index, path_id in enumerate(selected_path_ids)}
+        covered_features.sort(key=lambda feature: selected_order.get(feature["path_id"], len(selected_order)))
 
     missing_workflows = (ranker_payload or {}).get("missing_workflows", [])[:8]
     status = "complete" if selected_path_ids and not uncovered_features and not missing_workflows else "partial"
@@ -832,19 +849,21 @@ def _coverage_scenes(scan: dict, coverage: dict, ranker_payload: dict | None = N
     title = _page_title(scan.get("page", {}), scan.get("dom", {}))
     start_url = _recording_start_url(scan)
     scenes = [_intro_scene(title, scan.get("page", {}).get("final_url"))]
+    ordered_path_ids = _presentation_ordered_path_ids(selected_path_ids, paths_by_id, start_url)
 
-    for index, path_id in enumerate(selected_path_ids, 1):
+    for index, path_id in enumerate(ordered_path_ids, 1):
         path = paths_by_id.get(path_id)
         if not path:
             continue
 
         if index > 1:
-            reset_url = _path_start_url(path, start_url)
+            reset_url = _path_work_surface_url(path, start_url)
             if reset_url:
                 scenes.append(_workflow_reset_scene(path, index, reset_url))
 
+        transitions = _presentation_transitions_for_path(path, include_navigation=index == 1)
         path_scenes = _transition_scenes_for_path(
-            path.get("transitions", []),
+            transitions,
             source_path_id=path_id,
             max_transitions=None,
         )
@@ -860,6 +879,85 @@ def _coverage_scenes(scan: dict, coverage: dict, ranker_payload: dict | None = N
 
     scenes.append(_outro_scene(title))
     return scenes
+
+
+def _presentation_ordered_path_ids(
+    selected_path_ids: list[str],
+    paths_by_id: dict[str, dict],
+    fallback_url: str | None,
+) -> list[str]:
+    groups: dict[str, list[str]] = {}
+    for path_id in selected_path_ids:
+        path = paths_by_id.get(path_id)
+        if not path:
+            continue
+        group_key = _path_work_surface_group_key(path, fallback_url)
+        groups.setdefault(group_key, []).append(path_id)
+
+    def group_score(item: tuple[str, list[str]]) -> tuple:
+        _, path_ids = item
+        best_path = max(
+            (paths_by_id[path_id] for path_id in path_ids if path_id in paths_by_id),
+            key=lambda path: (int(path.get("score") or 0), len(path.get("transitions", []))),
+        )
+        return (int(best_path.get("score") or 0), len(path_ids))
+
+    ordered_path_ids = []
+    for _, path_ids in sorted(groups.items(), key=group_score, reverse=True):
+        ordered_path_ids.extend(
+            sorted(
+                path_ids,
+                key=lambda path_id: (
+                    int(paths_by_id.get(path_id, {}).get("score") or 0),
+                    len(paths_by_id.get(path_id, {}).get("transitions", [])),
+                ),
+                reverse=True,
+            )
+        )
+    return ordered_path_ids
+
+
+def _presentation_transitions_for_path(path: dict, include_navigation: bool) -> list[dict]:
+    transitions = path.get("transitions", [])
+    if include_navigation:
+        return transitions
+
+    product_index = _first_product_transition_index(transitions)
+    if product_index is None:
+        return transitions
+    return transitions[product_index:]
+
+
+def _first_product_transition_index(transitions: list[dict]) -> int | None:
+    for index, transition in enumerate(transitions):
+        if transition.get("kind") in PRODUCT_TRANSITION_KINDS:
+            return index
+        action_types = {action.get("type") for action in transition.get("actions", []) if action.get("type")}
+        if action_types & {"fill", "select"}:
+            return index
+    return None
+
+
+def _path_work_surface_url(path: dict, fallback_url: str | None) -> str | None:
+    transitions = path.get("transitions", [])
+    product_index = _first_product_transition_index(transitions)
+    if product_index is not None:
+        before_url = (transitions[product_index].get("outcome_summary") or {}).get("before_url")
+        if before_url:
+            return before_url
+
+    final_url = path.get("final_url")
+    if final_url:
+        return final_url
+    return _path_start_url(path, fallback_url)
+
+
+def _path_work_surface_group_key(path: dict, fallback_url: str | None) -> str:
+    url = _path_work_surface_url(path, fallback_url) or fallback_url or path.get("path_id") or "workflow"
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return url
 
 
 def _workflow_reset_scene(path: dict, index: int, url: str | None) -> dict:
