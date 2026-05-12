@@ -260,6 +260,8 @@ async def _keep_locator_in_recording_view(page, locator, scroll_policy: str) -> 
         """(element, scrollPolicy) => {
             const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
             const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+            const topMargin = Math.min(120, Math.max(72, viewportHeight * 0.14));
+            const bottomMargin = Math.min(120, Math.max(72, viewportHeight * 0.14));
 
             const isInViewport = (rect) =>
                 rect.bottom > 0 &&
@@ -274,13 +276,32 @@ async def _keep_locator_in_recording_view(page, locator, scroll_policy: str) -> 
                 rect.right <= viewportWidth;
 
             let rect = element.getBoundingClientRect();
-            if (scrollPolicy === "observe" && isInViewport(rect)) {
-                return false;
-            }
-            if (scrollPolicy !== "observe" && isFullyVisible(rect)) {
-                return false;
+            if (scrollPolicy === "observe") {
+                const fitsWithMargins = rect.height <= viewportHeight - topMargin - bottomMargin;
+                const clearlyVisible = fitsWithMargins
+                    ? rect.top >= topMargin && rect.bottom <= viewportHeight - bottomMargin
+                    : rect.top >= topMargin && rect.top <= viewportHeight * 0.35;
+                if (clearlyVisible && rect.right > 0 && rect.left < viewportWidth) {
+                    return false;
+                }
+
+                const maxY = Math.max(0, document.documentElement.scrollHeight - viewportHeight);
+                const rawTargetY = fitsWithMargins
+                    ? window.scrollY + rect.top - ((viewportHeight - rect.height) / 2)
+                    : window.scrollY + rect.top - topMargin;
+                const targetY = Math.max(0, Math.min(maxY, rawTargetY));
+                if (Math.abs(targetY - window.scrollY) < 8 && isInViewport(rect)) {
+                    return false;
+                }
+
+                const startingY = window.scrollY;
+                window.scrollTo({top: targetY, behavior: "auto"});
+                return Math.abs(window.scrollY - startingY) >= 8;
             }
 
+            if (isFullyVisible(rect)) {
+                return false;
+            }
             const startingY = window.scrollY;
             element.scrollIntoView({block: "nearest", inline: "nearest", behavior: "auto"});
             return Math.abs(window.scrollY - startingY) >= 8;

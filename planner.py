@@ -54,6 +54,35 @@ OUTCOME_FOCUS_TERMS = (
     "summary",
     "total",
 )
+PRIMARY_OUTCOME_TERMS = (
+    "additional grade",
+    "average grade",
+    "final exam grade",
+    "gpa",
+    "letter grade",
+    "overall grade",
+    "required",
+    "result",
+    "score",
+    "total credits",
+)
+PRIMARY_OUTCOME_SELECTOR_TERMS = (
+    "#avg",
+    "#avglet",
+    "#fg",
+    "#final",
+    "#gpa",
+    "#letter",
+    "#overall",
+    "#result",
+    "#score",
+    "#total",
+    'name="letter"',
+)
+SECONDARY_OUTCOME_TERMS = (
+    "calculation",
+    "explanation",
+)
 PRODUCT_TRANSITION_KINDS = {
     "input_submit",
     "llm_goal_workflow",
@@ -694,7 +723,7 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
                     "feature_id": item["feature_id"],
                     "title": item["feature_title"],
                     "candidate_path_ids": [],
-                    "reason": item["rejected_reason"] or "No validated product workflow selected for this feature yet.",
+                    "reason": _coverage_uncovered_reason(item),
                 },
             )
             uncovered["candidate_path_ids"].append(item["path_id"])
@@ -744,6 +773,7 @@ def _coverage_path_item(path: dict, rank_item: dict | None, rejected_reason: str
     reason = (rank_item or {}).get("reason") or "; ".join(path.get("selection_reasons", [])[:2])
     quality_tags = path.get("quality_tags", [])
     workflow_kind = _path_workflow_kind(path)
+    has_presentable_outcome = _path_has_presentable_outcome(path)
     return {
         "path_id": path_id,
         "feature_id": _slug(feature_title),
@@ -754,6 +784,7 @@ def _coverage_path_item(path: dict, rank_item: dict | None, rejected_reason: str
         "rejected_reason": rejected_reason,
         "quality_tags": quality_tags,
         "workflow_kind": workflow_kind,
+        "has_presentable_outcome": has_presentable_outcome,
     }
 
 
@@ -768,10 +799,12 @@ def _coverage_demo_value(path: dict, rank_item: dict | None) -> float:
 
 
 def _coverage_item_is_selected(item: dict, force_selected: bool = False) -> bool:
-    if force_selected:
-        return True
     if item["rejected_reason"]:
         return False
+    if item["workflow_kind"] == "product_workflow" and not item.get("has_presentable_outcome"):
+        return False
+    if force_selected:
+        return True
     if item["demo_value_score"] >= MIN_LLM_COVERAGE_SCORE:
         return True
     return item["demo_value_score"] >= MIN_LLM_PRODUCT_WORKFLOW_SCORE and item["workflow_kind"] == "product_workflow"
@@ -783,6 +816,14 @@ def _coverage_item_is_uncovered(item: dict) -> bool:
     if item["rejected_reason"]:
         return False
     return item["demo_value_score"] >= MIN_LLM_COVERAGE_SCORE
+
+
+def _coverage_uncovered_reason(item: dict) -> str:
+    if item["rejected_reason"]:
+        return item["rejected_reason"]
+    if item["workflow_kind"] == "product_workflow" and not item.get("has_presentable_outcome"):
+        return "Validated actions did not expose a clear presentable output for this workflow."
+    return "No validated product workflow selected for this feature yet."
 
 
 def _path_has_product_workflow(path: dict) -> bool:
@@ -817,6 +858,39 @@ def _path_workflow_kind(path: dict) -> str:
     if path.get("same_origin") and path.get("final_url"):
         return "navigation"
     return "utility"
+
+
+def _path_has_presentable_outcome(path: dict) -> bool:
+    for transition in path.get("transitions", []):
+        if transition.get("kind") not in PRODUCT_TRANSITION_KINDS and not _transition_has_form_submission(transition):
+            continue
+
+        summary = transition.get("outcome_summary") or {}
+        if summary.get("added_text") or summary.get("removed_text"):
+            return True
+
+        action_selectors = {
+            action.get("selector")
+            for action in transition.get("actions", [])
+            if action.get("selector")
+        }
+        for control in summary.get("changed_controls") or []:
+            selectors = control.get("selectors") or []
+            if _control_matches_action_selector(selectors, action_selectors) and transition.get("kind") != "toggle":
+                continue
+            if _control_has_changed_value(control):
+                return True
+
+    return False
+
+
+def _transition_has_form_submission(transition: dict) -> bool:
+    action_types = [action.get("type") for action in transition.get("actions", [])]
+    return bool({"fill", "select"} & set(action_types)) and bool({"click", "press"} & set(action_types))
+
+
+def _control_matches_action_selector(selectors: list[str], action_selectors: set[str]) -> bool:
+    return any(selector in action_selectors for selector in selectors)
 
 
 def _path_feature_title(path: dict) -> str:
@@ -1537,6 +1611,7 @@ def _outcome_focus_for_transition(transition: dict) -> dict | None:
         selector = selectors[0] if selectors else None
         if not selector:
             continue
+        matches_action_selector = _control_matches_action_selector(selectors, action_selectors)
 
         changed_text = _changed_control_after_text(control)
         if not changed_text:
@@ -1545,13 +1620,19 @@ def _outcome_focus_for_transition(transition: dict) -> dict | None:
         name = (control.get("name") or "").strip()
         haystack = f"{name} {changed_text} {selector}".lower()
         score = 0
-        if selector not in action_selectors:
+        if not matches_action_selector:
             score += 100
         else:
             score -= 30
         score += max(0, 20 - index)
-        if any(term in haystack for term in OUTCOME_FOCUS_TERMS):
+        if any(term in haystack for term in PRIMARY_OUTCOME_TERMS):
+            score += 60
+        elif any(term in haystack for term in OUTCOME_FOCUS_TERMS):
             score += 40
+        if any(term in haystack for term in PRIMARY_OUTCOME_SELECTOR_TERMS):
+            score += 45
+        if any(term in haystack for term in SECONDARY_OUTCOME_TERMS):
+            score -= 20
         if len(changed_text) > 12:
             score += 10
 
@@ -1576,6 +1657,15 @@ def _changed_control_after_text(control: dict) -> str:
         if after and after != before:
             parts.append(after)
     return " ".join(parts)
+
+
+def _control_has_changed_value(control: dict) -> bool:
+    for change in (control.get("changes") or {}).values():
+        before = str(change.get("before") or "").strip()
+        after = str(change.get("after") or "").strip()
+        if after and after != before:
+            return True
+    return False
 
 
 def _clean_transition_label(label: str) -> str:
