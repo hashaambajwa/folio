@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -48,6 +49,8 @@ MAX_LLM_EXPLORATION_GOALS = 12
 MAX_LLM_GOAL_WORKFLOWS = 4
 MAX_LLM_GOAL_STATES = 16
 MAX_LLM_GOAL_VALIDATIONS = 8
+MAX_LLM_GOAL_REPAIRS = 4
+MAX_LLM_GOAL_REPAIR_CANDIDATES = 2
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
@@ -63,6 +66,8 @@ RISK_WORDS = {
     "checkout",
     "clear",
     "delete",
+    "fdbk",
+    "feedback",
     "invite",
     "logout",
     "pay",
@@ -106,10 +111,12 @@ async def scan(
     llm_expand: bool = False,
     llm_goals: bool = False,
     validate_goals: bool = False,
+    repair_goals: bool = False,
     llm_model: str | None = None,
     max_llm_expansions: int = MAX_LLM_EXPANSIONS,
     max_llm_goals: int = MAX_LLM_EXPLORATION_GOALS,
     max_goal_validations: int = MAX_LLM_GOAL_VALIDATIONS,
+    max_goal_repairs: int = MAX_LLM_GOAL_REPAIRS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -200,7 +207,7 @@ async def scan(
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
 
-            if llm_goals or validate_goals:
+            if llm_goals or validate_goals or repair_goals:
                 exploration_goals = _generate_llm_exploration_goals(
                     start_url=final_url,
                     states=states,
@@ -210,7 +217,7 @@ async def scan(
                     max_goals=max_llm_goals,
                 )
 
-            if validate_goals:
+            if validate_goals or repair_goals:
                 goal_validation = await _validate_exploration_goal_candidates(
                     browser=browser,
                     start_url=final_url,
@@ -224,6 +231,26 @@ async def scan(
                     timeout_ms=timeout_ms,
                     max_validations=max_goal_validations,
                 )
+
+                if repair_goals:
+                    repairs = await _repair_failed_goal_candidates(
+                        browser=browser,
+                        start_url=final_url,
+                        output_dir=output_dir,
+                        states=states,
+                        transitions=transitions,
+                        exploration_goals=exploration_goals,
+                        goal_validation=goal_validation,
+                        viewport=viewport,
+                        console_errors=console_errors,
+                        page_errors=page_errors,
+                        timeout_ms=timeout_ms,
+                        model=llm_model,
+                        max_repairs=max_goal_repairs,
+                    )
+                    goal_validation["repairs"] = repairs
+                    goal_validation["total_attempted"] = goal_validation.get("attempted", 0) + repairs.get("attempted", 0)
+                    goal_validation["total_accepted"] = goal_validation.get("accepted", 0) + repairs.get("accepted", 0)
                 candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
@@ -244,10 +271,12 @@ async def scan(
             "llm_expand": llm_expand,
             "llm_goals": llm_goals,
             "validate_goals": validate_goals,
+            "repair_goals": repair_goals,
             "llm_model": llm_model,
             "max_llm_expansions": max_llm_expansions,
             "max_llm_goals": max_llm_goals,
             "max_goal_validations": max_goal_validations,
+            "max_goal_repairs": max_goal_repairs,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -388,6 +417,8 @@ async def _explore_states(
             if trial["status"] != "success":
                 transition["status"] = trial["status"]
                 transition["error"] = trial.get("error")
+                if trial.get("failure"):
+                    transition["failure"] = trial["failure"]
                 transitions.append(transition)
                 continue
 
@@ -552,6 +583,7 @@ async def _validate_workflow_candidates(
             "exploration_goal_id": candidate.get("exploration_goal_id"),
             "feature": candidate.get("feature"),
             "confidence": candidate.get("confidence"),
+            "repaired_from": candidate.get("repaired_from"),
             "origin": candidate.get("origin") or default_origin,
             "actions": candidate["actions"],
             "status": "pending",
@@ -572,14 +604,29 @@ async def _validate_workflow_candidates(
         if trial["status"] != "success":
             transition["status"] = trial["status"]
             transition["error"] = trial.get("error")
+            if trial.get("failure"):
+                transition["failure"] = trial["failure"]
             transitions.append(transition)
             results.append(_llm_expansion_result(candidate, transition))
             continue
 
         next_state = trial["state"]
         transition["outcome_summary"] = _transition_outcome_summary(parent_state, next_state)
+        if _is_llm_candidate(candidate) and not _has_meaningful_llm_outcome(
+            transition["outcome_summary"],
+            actions=candidate.get("actions", []),
+        ):
+            transition["status"] = "no_meaningful_outcome"
+            transition["to"] = next_state["state_id"]
+            transitions.append(transition)
+            results.append(_llm_expansion_result(candidate, transition))
+            continue
+
         duplicate_state_id = signatures.get(next_state["signature"])
-        if duplicate_state_id and not _has_meaningful_llm_outcome(transition["outcome_summary"]):
+        if duplicate_state_id and not _has_meaningful_llm_outcome(
+            transition["outcome_summary"],
+            actions=candidate.get("actions", []),
+        ):
             transition["status"] = "duplicate"
             transition["to"] = duplicate_state_id
             transitions.append(transition)
@@ -612,21 +659,35 @@ def _llm_expansion_result(candidate: dict, transition: dict) -> dict:
         "exploration_goal_id": candidate.get("exploration_goal_id"),
         "feature": candidate.get("feature"),
         "confidence": candidate.get("confidence"),
+        "repaired_from": candidate.get("repaired_from"),
         "repair_note": candidate.get("repair_note"),
         "status": transition.get("status"),
         "to": transition.get("to"),
         "duplicate_of": transition.get("duplicate_of"),
         "error": transition.get("error"),
+        "failure": _failure_result_for_scan(transition.get("failure")),
     }
 
 
-def _has_meaningful_llm_outcome(outcome_summary: dict | None) -> bool:
+def _is_llm_candidate(candidate: dict) -> bool:
+    return str(candidate.get("origin") or "").startswith("llm") or str(candidate.get("kind") or "").startswith("llm")
+
+
+def _has_meaningful_llm_outcome(outcome_summary: dict | None, actions: list[dict] | None = None) -> bool:
     if not outcome_summary:
         return False
     if outcome_summary.get("url_changed") or outcome_summary.get("added_text") or outcome_summary.get("removed_text"):
         return True
 
+    self_filled_selectors = {
+        action.get("selector")
+        for action in actions or []
+        if action.get("type") in {"fill", "select"} and action.get("selector")
+    }
     for control in outcome_summary.get("changed_controls", []):
+        selectors = set(control.get("selectors") or [])
+        if selectors and selectors.issubset(self_filled_selectors):
+            continue
         changes = control.get("changes", {})
         for change in changes.values():
             before = change.get("before")
@@ -658,11 +719,27 @@ async def _run_probe_candidate(
 
         replay_result = await _execute_probe_actions(page, parent_state.get("replay_actions", []))
         if replay_result["status"] != "success":
-            return {"status": "replay_failed", "error": replay_result.get("error")}
+            failure = await _capture_probe_failure(
+                page=page,
+                output_dir=output_dir,
+                parent_state=parent_state,
+                candidate=candidate,
+                action_result=replay_result,
+                stage="replay",
+            )
+            return {"status": "replay_failed", "error": replay_result.get("error"), "failure": failure}
 
         action_result = await _execute_probe_actions(page, candidate["actions"])
         if action_result["status"] != "success":
-            return {"status": "action_failed", "error": action_result.get("error")}
+            failure = await _capture_probe_failure(
+                page=page,
+                output_dir=output_dir,
+                parent_state=parent_state,
+                candidate=candidate,
+                action_result=action_result,
+                stage="candidate",
+            )
+            return {"status": "action_failed", "error": action_result.get("error"), "failure": failure}
 
         state_id = f"state-{next_index}-{_slug(candidate['label'])}"
         screenshot_path = output_dir / f"{state_id}.png"
@@ -683,13 +760,20 @@ async def _run_probe_candidate(
 
 
 async def _execute_probe_actions(page, actions: list[dict]) -> dict:
-    for action in actions:
+    completed_actions = []
+    for index, action in enumerate(actions):
         try:
             action_type = action["type"]
             selector = action.get("selector")
             if action_type in {"click", "fill", "press", "select"}:
                 if not selector:
-                    return {"status": "failed", "error": "Missing selector"}
+                    return {
+                        "status": "failed",
+                        "error": "Missing selector",
+                        "failed_action_index": index,
+                        "failed_action": action,
+                        "completed_actions": completed_actions,
+                    }
                 locator = page.locator(selector).first
                 wait_state = "attached" if action.get("allow_hidden") else "visible"
                 await locator.wait_for(state=wait_state, timeout=PROBE_ACTION_TIMEOUT_MS)
@@ -718,13 +802,112 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
             elif action_type == "observe":
                 await page.wait_for_timeout(500)
             else:
-                return {"status": "failed", "error": f"Unsupported probe action: {action_type}"}
+                return {
+                    "status": "failed",
+                    "error": f"Unsupported probe action: {action_type}",
+                    "failed_action_index": index,
+                    "failed_action": action,
+                    "completed_actions": completed_actions,
+                }
 
             await _wait_for_settle(page)
+            completed_actions.append(action)
         except Exception as exc:
-            return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "failed_action_index": index,
+                "failed_action": action,
+                "completed_actions": completed_actions,
+            }
 
     return {"status": "success"}
+
+
+async def _capture_probe_failure(
+    page,
+    output_dir: Path,
+    parent_state: dict,
+    candidate: dict,
+    action_result: dict,
+    stage: str,
+) -> dict:
+    failure_id = _slug(
+        f"failure-{parent_state.get('state_id')}-{candidate.get('candidate_id')}-{stage}-{action_result.get('failed_action_index')}"
+    )
+    screenshot_path = output_dir / f"{failure_id}.png"
+    dom_path = output_dir / f"{failure_id}.dom.json"
+
+    title = ""
+    dom_summary = {}
+    screenshot_artifact = None
+    dom_artifact = None
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+
+    try:
+        dom_summary = await page.evaluate(_dom_summary_script())
+        dom_path.write_text(json.dumps(dom_summary, indent=2), encoding="utf-8")
+        dom_artifact = str(dom_path)
+    except Exception:
+        dom_summary = {}
+
+    try:
+        await page.screenshot(path=str(screenshot_path), full_page=False)
+        screenshot_artifact = str(screenshot_path)
+    except Exception:
+        screenshot_artifact = None
+
+    visible_context = _state_for_expander(
+        {
+            "state_id": f"{parent_state.get('state_id')}:failure",
+            "title": title,
+            "url": page.url,
+            "depth": parent_state.get("depth"),
+            "parent_state_id": parent_state.get("state_id"),
+            "replay_actions": parent_state.get("replay_actions", []),
+            "dom": dom_summary,
+        }
+    )
+    return {
+        "stage": stage,
+        "url": page.url,
+        "title": title,
+        "parent_state_id": parent_state.get("state_id"),
+        "candidate_id": candidate.get("candidate_id"),
+        "label": candidate.get("label"),
+        "error": action_result.get("error"),
+        "failed_action_index": action_result.get("failed_action_index"),
+        "failed_action": action_result.get("failed_action"),
+        "completed_actions": action_result.get("completed_actions", []),
+        "artifacts": {
+            "screenshot": screenshot_artifact,
+            "dom_json": dom_artifact,
+        },
+        "visible_context": visible_context,
+    }
+
+
+def _failure_result_for_scan(failure: dict | None) -> dict | None:
+    if not failure:
+        return None
+
+    return {
+        "stage": failure.get("stage"),
+        "url": failure.get("url"),
+        "title": failure.get("title"),
+        "parent_state_id": failure.get("parent_state_id"),
+        "candidate_id": failure.get("candidate_id"),
+        "label": failure.get("label"),
+        "error": failure.get("error"),
+        "failed_action_index": failure.get("failed_action_index"),
+        "failed_action": failure.get("failed_action"),
+        "completed_actions": failure.get("completed_actions", []),
+        "artifacts": failure.get("artifacts", {}),
+        "visible_context": failure.get("visible_context", {}),
+    }
 
 
 async def _click_associated_label(page, selector: str) -> bool:
@@ -922,6 +1105,372 @@ async def _validate_exploration_goal_candidates(
     }
 
 
+async def _repair_failed_goal_candidates(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    exploration_goals: dict,
+    goal_validation: dict,
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    model: str | None,
+    max_repairs: int,
+) -> dict:
+    if goal_validation.get("status") != "completed":
+        return {
+            "status": "skipped",
+            "reason": f"Goal validation was not completed: {goal_validation.get('status')}",
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "skipped",
+            "reason": "Missing OPENAI_API_KEY.",
+            "model": model,
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    failed_results = _repairable_goal_failures(goal_validation, max_repairs=max_repairs)
+    if not failed_results:
+        return {
+            "status": "completed",
+            "model": model,
+            "selected_failure_count": 0,
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+            "requests": [],
+            "rejected": [],
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    signatures = {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+    workflow_lookup = _exploration_goal_workflow_lookup(exploration_goals)
+    repair_candidates: list[dict] = []
+    requests: list[dict] = []
+    rejected: list[dict] = []
+
+    for failed_result in failed_results:
+        workflow_entry = workflow_lookup.get(failed_result.get("candidate_id"))
+        if not workflow_entry:
+            rejected.append(
+                {
+                    "candidate_id": failed_result.get("candidate_id"),
+                    "reason": "Could not find the original exploration goal workflow.",
+                }
+            )
+            continue
+
+        goal = workflow_entry["goal"]
+        workflow = workflow_entry["workflow"]
+        parent_state = states_by_id.get(failed_result.get("parent_state_id"))
+        failure = failed_result.get("failure") or {}
+        if not parent_state:
+            rejected.append(
+                {
+                    "candidate_id": failed_result.get("candidate_id"),
+                    "reason": "Could not find the original parent state.",
+                }
+            )
+            continue
+        if not failure:
+            rejected.append(
+                {
+                    "candidate_id": failed_result.get("candidate_id"),
+                    "reason": "No failure artifact was captured for this workflow.",
+                }
+            )
+            continue
+
+        context = _goal_repair_context(
+            start_url=start_url,
+            goal=goal,
+            workflow=workflow,
+            failed_result=failed_result,
+            parent_state=parent_state,
+            failure=failure,
+        )
+        screenshot_path = (failure.get("artifacts") or {}).get("screenshot")
+        try:
+            payload = _call_openai_goal_repair(
+                context,
+                api_key=api_key,
+                model=model,
+                screenshot_path=screenshot_path,
+            )
+        except Exception as exc:
+            requests.append(
+                {
+                    "candidate_id": failed_result.get("candidate_id"),
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        candidates, candidate_rejections = _normalize_goal_repair_candidates(
+            payload=payload,
+            goal=goal,
+            workflow=workflow,
+            failed_result=failed_result,
+            parent_state=parent_state,
+            failure=failure,
+        )
+        repair_candidates.extend(candidates)
+        rejected.extend(candidate_rejections)
+        requests.append(
+            {
+                "candidate_id": failed_result.get("candidate_id"),
+                "status": "completed",
+                "rationale": _clean_label(payload.get("rationale") or ""),
+                "abandoned_reason": _clean_label(payload.get("abandoned_reason") or ""),
+                "proposed_candidate_count": len(payload.get("repaired_workflow_candidates", [])),
+                "accepted_for_validation": len(candidates),
+            }
+        )
+
+    if not repair_candidates:
+        return {
+            "status": "completed",
+            "model": model,
+            "selected_failure_count": len(failed_results),
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+            "requests": requests,
+            "rejected": rejected,
+        }
+
+    _append_goal_repair_workflows(exploration_goals, repair_candidates)
+    accepted, attempted, results = await _validate_workflow_candidates(
+        browser=browser,
+        start_url=start_url,
+        output_dir=output_dir,
+        states=states,
+        transitions=transitions,
+        viewport=viewport,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        timeout_ms=timeout_ms,
+        candidates=repair_candidates,
+        states_by_id=states_by_id,
+        signatures=signatures,
+        default_origin="llm_goal_repair",
+    )
+    _attach_goal_validation_results(exploration_goals, results)
+    return {
+        "status": "completed",
+        "model": model,
+        "selected_failure_count": len(failed_results),
+        "attempted": attempted,
+        "accepted": accepted,
+        "results": results,
+        "requests": requests,
+        "rejected": rejected,
+    }
+
+
+def _repairable_goal_failures(goal_validation: dict, max_repairs: int) -> list[dict]:
+    failures = []
+    for result in goal_validation.get("results", []):
+        if len(failures) >= max(0, max_repairs):
+            break
+        if result.get("status") not in {"action_failed", "replay_failed"}:
+            continue
+        if not result.get("failure"):
+            continue
+        failures.append(result)
+    return failures
+
+
+def _exploration_goal_workflow_lookup(exploration_goals: dict) -> dict[str, dict]:
+    lookup = {}
+    for goal in exploration_goals.get("goals", []):
+        for workflow in goal.get("workflow_candidates", []):
+            candidate_id = workflow.get("candidate_id")
+            if candidate_id:
+                lookup[candidate_id] = {"goal": goal, "workflow": workflow}
+    return lookup
+
+
+def _goal_repair_context(
+    start_url: str,
+    goal: dict,
+    workflow: dict,
+    failed_result: dict,
+    parent_state: dict,
+    failure: dict,
+) -> dict:
+    return {
+        "start_url": start_url,
+        "task": "Repair a single failed workflow so it can be replayed from the original parent state and validated by Playwright.",
+        "supported_actions": ["observe", "click", "fill", "press", "select"],
+        "rules": [
+            "Use only selectors from parent_state or failure.visible_context.",
+            "Return the full repaired action sequence from the original parent_state, including prerequisite clicks that reveal later controls.",
+            "Do not repeat a selector that failed because it was hidden or detached when a visible replacement selector exists.",
+            "Prefer visible form fields and result-producing controls over navigation, site search, footer links, account flows, destructive actions, or ads.",
+            "If the workflow cannot be repaired safely with the supplied selectors, return no repaired workflow candidates and explain why.",
+        ],
+        "goal": {
+            "goal_id": goal.get("goal_id"),
+            "title": goal.get("title"),
+            "feature": goal.get("feature"),
+            "priority": goal.get("priority"),
+            "hypothesis": goal.get("hypothesis"),
+            "expected_outcome": goal.get("expected_outcome"),
+            "evidence": goal.get("evidence", []),
+        },
+        "original_workflow": {
+            "candidate_id": workflow.get("candidate_id"),
+            "parent_state_id": workflow.get("parent_state_id"),
+            "label": workflow.get("label"),
+            "confidence": workflow.get("confidence"),
+            "actions": workflow.get("actions", []),
+        },
+        "failed_validation": {
+            "status": failed_result.get("status"),
+            "error": failed_result.get("error"),
+            "failed_action_index": failure.get("failed_action_index"),
+            "failed_action": failure.get("failed_action"),
+            "completed_actions": failure.get("completed_actions", []),
+            "failure_url": failure.get("url"),
+            "failure_title": failure.get("title"),
+        },
+        "parent_state": _state_for_expander(parent_state),
+        "failure": {
+            "artifacts": failure.get("artifacts", {}),
+            "visible_context": failure.get("visible_context", {}),
+        },
+    }
+
+
+def _normalize_goal_repair_candidates(
+    payload: dict,
+    goal: dict,
+    workflow: dict,
+    failed_result: dict,
+    parent_state: dict,
+    failure: dict,
+) -> tuple[list[dict], list[dict]]:
+    candidates = []
+    rejected = []
+    extra_selector_maps = [
+        _selectors_for_visible_context(failure.get("visible_context", {}))
+    ]
+    original_candidate_id = failed_result.get("candidate_id") or workflow.get("candidate_id") or "goal"
+
+    for index, raw_candidate in enumerate(payload.get("repaired_workflow_candidates", [])[:MAX_LLM_GOAL_REPAIR_CANDIDATES], 1):
+        requested_parent_state_id = raw_candidate.get("parent_state_id")
+        if requested_parent_state_id and requested_parent_state_id != parent_state.get("state_id"):
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": f"Repair changed parent_state_id from {parent_state.get('state_id')} to {requested_parent_state_id}.",
+                }
+            )
+            continue
+
+        actions, errors = _normalize_llm_workflow_actions(
+            raw_candidate,
+            parent_state,
+            additional_selector_maps=extra_selector_maps,
+        )
+        if errors:
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": "; ".join(errors),
+                }
+            )
+            continue
+        if not _is_meaningful_workflow(actions):
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": "Repaired workflow must include fill/select and click/press actions.",
+                }
+            )
+            continue
+
+        label = _clean_label(raw_candidate.get("label") or f"Repaired workflow {index}")
+        confidence = _enum_value(raw_candidate.get("confidence"), {"high", "medium", "low"}, "medium")
+        repair_strategy = _clean_label(raw_candidate.get("repair_strategy") or payload.get("rationale") or "")
+        candidates.append(
+            {
+                "candidate_id": f"repair:{original_candidate_id}:{index}:{_slug(label)}",
+                "parent_state_id": parent_state.get("state_id"),
+                "requested_parent_state_id": workflow.get("requested_parent_state_id") or workflow.get("parent_state_id"),
+                "kind": "llm_goal_workflow",
+                "label": label,
+                "goal": goal.get("hypothesis") or goal.get("title"),
+                "expected_outcome": goal.get("expected_outcome"),
+                "exploration_goal_id": goal.get("goal_id"),
+                "feature": goal.get("feature"),
+                "confidence": confidence,
+                "repaired_from": original_candidate_id,
+                "repair_note": repair_strategy,
+                "origin": "llm_goal_repair",
+                "priority": 5,
+                "bounds": {},
+                "actions": actions,
+            }
+        )
+
+    return candidates, rejected
+
+
+def _append_goal_repair_workflows(exploration_goals: dict, repair_candidates: list[dict]) -> None:
+    goals_by_id = {
+        goal.get("goal_id"): goal
+        for goal in exploration_goals.get("goals", [])
+        if goal.get("goal_id")
+    }
+    for candidate in repair_candidates:
+        goal = goals_by_id.get(candidate.get("exploration_goal_id"))
+        if not goal:
+            continue
+        goal.setdefault("workflow_candidates", []).append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "parent_state_id": candidate.get("parent_state_id"),
+                "requested_parent_state_id": candidate.get("requested_parent_state_id"),
+                "label": candidate.get("label"),
+                "confidence": candidate.get("confidence"),
+                "requires_validation": True,
+                "repair_note": candidate.get("repair_note"),
+                "repaired_from": candidate.get("repaired_from"),
+                "actions": candidate.get("actions", []),
+            }
+        )
+    exploration_goals["workflow_candidate_count"] = sum(
+        len(goal.get("workflow_candidates", []))
+        for goal in exploration_goals.get("goals", [])
+    )
+
+
 def _goal_validation_candidates(exploration_goals: dict, max_validations: int) -> list[dict]:
     priority_order = {"high": 0, "medium": 1, "low": 2}
     goals = sorted(
@@ -977,6 +1526,7 @@ def _attach_goal_validation_results(exploration_goals: dict, results: list[dict]
                 "state_id": result.get("to"),
                 "duplicate_of": result.get("duplicate_of"),
                 "error": result.get("error"),
+                "failure": result.get("failure"),
             }
             goal_results.append(result)
 
@@ -1035,6 +1585,92 @@ def _call_openai_exploration_goals(context: dict, api_key: str, model: str, max_
     return json.loads(output_text)
 
 
+def _call_openai_goal_repair(
+    context: dict,
+    api_key: str,
+    model: str,
+    screenshot_path: str | None,
+) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    user_content = [
+        {
+            "type": "input_text",
+            "text": json.dumps(context, indent=2),
+        }
+    ]
+    image_url = _image_data_url(screenshot_path)
+    if image_url:
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": "low",
+            }
+        )
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_goal_repair_prompt(),
+            },
+            {
+                "role": "user",
+                "content": user_content,
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_goal_repair",
+                "strict": True,
+                "schema": _llm_goal_repair_schema(),
+            }
+        },
+        "max_output_tokens": 4_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=75, context=_https_context()) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
+def _image_data_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    image_path = Path(path)
+    if not image_path.exists() or image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        return None
+
+    mime_type = "image/png"
+    if image_path.suffix.lower() in {".jpg", ".jpeg"}:
+        mime_type = "image/jpeg"
+    elif image_path.suffix.lower() == ".webp":
+        mime_type = "image/webp"
+
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _https_context() -> ssl.SSLContext:
     try:
         import certifi
@@ -1084,6 +1720,22 @@ def _llm_exploration_goal_prompt() -> str:
         "will treat every workflow candidate as untrusted until Playwright validates it. Keep each description, "
         "hypothesis, evidence item, blocker, and outcome concise. For already validated features, include workflow "
         "candidates only for meaningfully distinct variations that are not already covered by candidate_paths."
+    )
+
+
+def _llm_goal_repair_prompt() -> str:
+    return (
+        "You are Folio's workflow repair strategist. A Playwright-validated product workflow failed after partial "
+        "execution. Use the original parent state, failure DOM context, exact error, completed actions, failed action, "
+        "and screenshot to repair the workflow. The returned actions must replay from the original parent_state_id, "
+        "not from the failure state, so include any prerequisite action that reveals controls used later. Use only "
+        "selectors provided in parent_state or failure.visible_context. Prefer changing the smallest useful part of "
+        "the workflow: replace hidden or stale controls with visible controls, switch fill/select action types when "
+        "the DOM evidence shows a better control type, and add an observe action only when the UI needs a short pause. "
+        "Do not invent selectors, do not use destructive/account/payment/navigation actions, and do not chase generic "
+        "site chrome unless it is the product itself. If the workflow cannot be safely repaired with the supplied "
+        "evidence, return an empty repaired_workflow_candidates array and a concise abandoned_reason. Return only JSON "
+        "matching the schema."
     )
 
 
@@ -1421,6 +2073,57 @@ def _llm_exploration_goal_schema(max_goals: int) -> dict:
     }
 
 
+def _llm_goal_repair_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "repaired_workflow_candidates", "abandoned_reason"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "repaired_workflow_candidates": {
+                "type": "array",
+                "maxItems": MAX_LLM_GOAL_REPAIR_CANDIDATES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "parent_state_id",
+                        "label",
+                        "confidence",
+                        "repair_strategy",
+                        "actions",
+                    ],
+                    "properties": {
+                        "parent_state_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "repair_strategy": {"type": "string"},
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_LLM_EXPANSION_ACTIONS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "description": {"type": "string"},
+                                    "selector": {"type": ["string", "null"]},
+                                    "value": {"type": ["string", "null"]},
+                                    "key": {"type": ["string", "null"]},
+                                    "allow_hidden": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "abandoned_reason": {"type": "string"},
+        },
+    }
+
+
 def _normalize_llm_workflow_candidates(
     payload: dict,
     states_by_id: dict[str, dict],
@@ -1669,8 +2372,12 @@ def _normalize_llm_workflow_actions(
     raw_candidate: dict,
     parent_state: dict,
     drop_unavailable: bool = False,
+    additional_selector_maps: list[dict[str, dict]] | None = None,
 ) -> tuple[list[dict], list[str]]:
     selector_map = _selectors_for_state(parent_state)
+    if additional_selector_maps:
+        for additional_map in additional_selector_maps:
+            selector_map.update(additional_map)
     actions = []
     errors = []
     for index, raw_action in enumerate(raw_candidate.get("actions", [])[:MAX_LLM_EXPANSION_ACTIONS], 1):
@@ -1758,10 +2465,26 @@ def _best_state_for_llm_workflow(raw_candidate: dict, states_by_id: dict[str, di
 
 
 def _selectors_for_state(state: dict) -> dict[str, dict]:
+    return _selectors_for_dom(state.get("dom", {}))
+
+
+def _selectors_for_dom(dom: dict) -> dict[str, dict]:
     selector_map = {}
-    for element in state.get("dom", {}).get("interactive", []):
+    for element in dom.get("interactive", []):
         for selector in element.get("selectors", []) or []:
             selector_map[selector] = element
+    return selector_map
+
+
+def _selectors_for_visible_context(context: dict) -> dict[str, dict]:
+    selector_map = {}
+    for element in context.get("interactive", []):
+        for selector in element.get("selectors", []) or []:
+            selector_map[selector] = element
+    for form in context.get("forms", []):
+        for field in form.get("fields", []):
+            for selector in field.get("selectors", []) or []:
+                selector_map[selector] = field
     return selector_map
 
 
@@ -1919,6 +2642,7 @@ def _path_transition(transition: dict) -> dict:
         "exploration_goal_id": transition.get("exploration_goal_id"),
         "feature": transition.get("feature"),
         "confidence": transition.get("confidence"),
+        "repaired_from": transition.get("repaired_from"),
         "duplicate_of": transition.get("duplicate_of"),
         "origin": transition.get("origin"),
         "actions": transition.get("actions", []),
@@ -2211,6 +2935,17 @@ def _is_actionable_text_input(element: dict) -> bool:
     if tag not in {"input", "textarea"}:
         return False
     if input_type in {"button", "checkbox", "file", "hidden", "image", "password", "radio", "range", "reset", "submit"}:
+        return False
+    hint = " ".join(
+        [
+            _element_name(element),
+            " ".join(element.get("selectors") or []),
+            str(element.get("attributes", {}).get("placeholder") or ""),
+            str(element.get("name") or ""),
+            str((element.get("form_context") or {}).get("label") or ""),
+        ]
+    ).lower()
+    if _has_risk_word(hint):
         return False
     return not _is_disabled(element)
 

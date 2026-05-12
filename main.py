@@ -11,6 +11,7 @@ from scanner import (
     DEFAULT_PROBE_DEPTH,
     MAX_LLM_EXPANSIONS,
     MAX_LLM_EXPLORATION_GOALS,
+    MAX_LLM_GOAL_REPAIRS,
     MAX_LLM_GOAL_VALIDATIONS,
     run_scan,
 )
@@ -79,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate LLM exploration goal workflow candidates with Playwright and add successful paths",
     )
+    scan_parser.add_argument(
+        "--repair-goals",
+        action="store_true",
+        help="repair failed LLM goal workflows with failure DOM/screenshots, then re-validate them",
+    )
     scan_parser.add_argument("--llm-model", help="OpenAI model for LLM-powered scan stages")
     scan_parser.add_argument(
         "--max-llm-expansions",
@@ -97,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_LLM_GOAL_VALIDATIONS,
         type=int,
         help="maximum exploration goal workflow candidates to validate",
+    )
+    scan_parser.add_argument(
+        "--max-goal-repairs",
+        default=MAX_LLM_GOAL_REPAIRS,
+        type=int,
+        help="maximum failed exploration goal workflows to ask the LLM to repair",
     )
     scan_parser.add_argument(
         "--source-root",
@@ -233,10 +245,12 @@ def handle_scan(args: argparse.Namespace) -> int:
         llm_expand=args.llm_expand,
         llm_goals=args.llm_goals,
         validate_goals=args.validate_goals,
+        repair_goals=args.repair_goals,
         llm_model=args.llm_model,
         max_llm_expansions=args.max_llm_expansions,
         max_llm_goals=args.max_llm_goals,
         max_goal_validations=args.max_goal_validations,
+        max_goal_repairs=args.max_goal_repairs,
     )
 
     dom = result["dom"]
@@ -265,11 +279,20 @@ def handle_scan(args: argparse.Namespace) -> int:
         )
     goal_validation = result.get("goal_validation", {})
     if goal_validation.get("status") != "disabled":
+        total_accepted = goal_validation.get("total_accepted", goal_validation.get("accepted", 0))
+        total_attempted = goal_validation.get("total_attempted", goal_validation.get("attempted", 0))
         print(
             "Goal validation: "
             f"{goal_validation.get('status')} "
-            f"({goal_validation.get('accepted', 0)}/{goal_validation.get('attempted', 0)} accepted)"
+            f"({total_accepted}/{total_attempted} accepted)"
         )
+        repairs = goal_validation.get("repairs", {})
+        if repairs:
+            print(
+                "Goal repairs: "
+                f"{repairs.get('status')} "
+                f"({repairs.get('accepted', 0)}/{repairs.get('attempted', 0)} accepted)"
+            )
     source_context = result.get("source_context")
     if source_context:
         summary = source_context.get("summary", {})

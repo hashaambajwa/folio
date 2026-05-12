@@ -88,6 +88,12 @@ Use `--validate-goals` to execute those goal workflow candidates in Playwright. 
 python main.py scan https://example.com --validate-goals --max-goal-validations 8
 ```
 
+Use `--repair-goals` when validated LLM goal workflows partially execute but fail on a later selector or control state. Folio captures the failed action, completed actions, failure DOM, and viewport screenshot, asks the LLM for a repaired action sequence, then validates the repaired workflow before promoting it.
+
+```bash
+python main.py scan https://example.com --validate-goals --repair-goals --max-goal-repairs 4
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash
