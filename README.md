@@ -104,6 +104,17 @@ python main.py scan https://example.com \
   --max-coverage-audit-workflows 8
 ```
 
+Use `--repair-outcomes` after LLM validation/audit when workflows execute but do not expose a clear changed output. Folio asks the LLM to repair those unclear-result workflows, then only promotes repairs that pass Playwright validation and produce a meaningful visible outcome instead of just filled inputs.
+
+```bash
+python main.py scan https://example.com \
+  --validate-goals \
+  --repair-goals \
+  --coverage-audit \
+  --repair-outcomes \
+  --max-outcome-repairs 4
+```
+
 Add `--source-root` when you also have the app code locally. Folio will add a bounded source summary to `scan.json` with route, component, package, README, and UI-string hints for the planner.
 
 ```bash

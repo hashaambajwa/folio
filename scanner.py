@@ -53,6 +53,8 @@ MAX_LLM_GOAL_REPAIRS = 4
 MAX_LLM_GOAL_REPAIR_CANDIDATES = 2
 MAX_LLM_COVERAGE_AUDIT_WORKFLOWS = 8
 MAX_LLM_COVERAGE_AUDIT_FEATURES = 16
+MAX_LLM_OUTCOME_REPAIRS = 4
+MAX_LLM_OUTCOME_REPAIR_CANDIDATES = 2
 PROBE_ACTION_TIMEOUT_MS = 8_000
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
@@ -115,12 +117,14 @@ async def scan(
     validate_goals: bool = False,
     repair_goals: bool = False,
     coverage_audit: bool = False,
+    repair_outcomes: bool = False,
     llm_model: str | None = None,
     max_llm_expansions: int = MAX_LLM_EXPANSIONS,
     max_llm_goals: int = MAX_LLM_EXPLORATION_GOALS,
     max_goal_validations: int = MAX_LLM_GOAL_VALIDATIONS,
     max_goal_repairs: int = MAX_LLM_GOAL_REPAIRS,
     max_coverage_audit_workflows: int = MAX_LLM_COVERAGE_AUDIT_WORKFLOWS,
+    max_outcome_repairs: int = MAX_LLM_OUTCOME_REPAIRS,
 ) -> dict:
     job_id = job_id or build_job_id(url)
     output_dir = Path(output_root) / job_id
@@ -138,6 +142,7 @@ async def scan(
     exploration_goals: dict = {"status": "disabled"}
     goal_validation: dict = {"status": "disabled"}
     coverage_audit_result: dict = {"status": "disabled"}
+    outcome_repair: dict = {"status": "disabled"}
     source_context = build_source_context(
         source_root,
         max_tree_entries=source_max_tree_entries,
@@ -278,6 +283,24 @@ async def scan(
                     max_workflows=max_coverage_audit_workflows,
                 )
                 candidate_paths = _candidate_paths_for_states(final_url, states)
+
+            if repair_outcomes:
+                candidate_paths = _candidate_paths_for_states(final_url, states)
+                outcome_repair = await _repair_unclear_outcome_workflows(
+                    browser=browser,
+                    start_url=final_url,
+                    output_dir=output_dir,
+                    states=states,
+                    transitions=transitions,
+                    candidate_paths=candidate_paths,
+                    viewport=viewport,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    timeout_ms=timeout_ms,
+                    model=llm_model,
+                    max_repairs=max_outcome_repairs,
+                )
+                candidate_paths = _candidate_paths_for_states(final_url, states)
         finally:
             await context.close()
             await browser.close()
@@ -299,12 +322,14 @@ async def scan(
             "validate_goals": validate_goals,
             "repair_goals": repair_goals,
             "coverage_audit": coverage_audit,
+            "repair_outcomes": repair_outcomes,
             "llm_model": llm_model,
             "max_llm_expansions": max_llm_expansions,
             "max_llm_goals": max_llm_goals,
             "max_goal_validations": max_goal_validations,
             "max_goal_repairs": max_goal_repairs,
             "max_coverage_audit_workflows": max_coverage_audit_workflows,
+            "max_outcome_repairs": max_outcome_repairs,
             "source_root": str(source_root) if source_root else None,
             "source_limits": {
                 "max_tree_entries": source_max_tree_entries,
@@ -339,6 +364,7 @@ async def scan(
         "exploration_goals": exploration_goals,
         "goal_validation": goal_validation,
         "coverage_audit": coverage_audit_result,
+        "outcome_repair": outcome_repair,
         "source_context": source_context,
         "browser_errors": {
             "console": console_errors,
@@ -717,7 +743,7 @@ def _has_meaningful_llm_outcome(outcome_summary: dict | None, actions: list[dict
     }
     for control in outcome_summary.get("changed_controls", []):
         selectors = set(control.get("selectors") or [])
-        if selectors and selectors.issubset(self_filled_selectors):
+        if selectors and selectors & self_filled_selectors:
             continue
         changes = control.get("changes", {})
         for change in changes.values():
@@ -1618,6 +1644,386 @@ async def _audit_coverage_with_llm(
     return normalized
 
 
+async def _repair_unclear_outcome_workflows(
+    browser,
+    start_url: str,
+    output_dir: Path,
+    states: list[dict],
+    transitions: list[dict],
+    candidate_paths: list[dict],
+    viewport: dict[str, int],
+    console_errors: list[dict],
+    page_errors: list[dict],
+    timeout_ms: int,
+    model: str | None,
+    max_repairs: int,
+) -> dict:
+    model = model or os.environ.get("FOLIO_LLM_MODEL") or DEFAULT_LLM_MODEL
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "skipped",
+            "reason": "Missing OPENAI_API_KEY.",
+            "model": model,
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+        }
+
+    states_by_id = {
+        state.get("state_id"): state
+        for state in states
+        if state.get("state_id")
+    }
+    failures = _repairable_outcome_failures(
+        candidate_paths=candidate_paths,
+        transitions=transitions,
+        max_repairs=max_repairs,
+    )
+    if not failures:
+        return {
+            "status": "completed",
+            "model": model,
+            "selected_failure_count": 0,
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+            "requests": [],
+            "rejected": [],
+        }
+
+    repair_candidates: list[dict] = []
+    requests: list[dict] = []
+    rejected: list[dict] = []
+
+    for failure in failures:
+        transition = failure["transition"]
+        parent_state = states_by_id.get(transition.get("from"))
+        if not parent_state:
+            rejected.append(
+                {
+                    "candidate_id": transition.get("candidate_id"),
+                    "path_id": failure.get("path_id"),
+                    "reason": "Could not find the transition parent state.",
+                }
+            )
+            continue
+
+        screenshot_path = _outcome_failure_screenshot_path(
+            output_dir=output_dir,
+            failure=failure,
+            parent_state=parent_state,
+            states_by_id=states_by_id,
+        )
+        context = _outcome_repair_context(
+            start_url=start_url,
+            failure=failure,
+            parent_state=parent_state,
+        )
+        try:
+            payload = _call_openai_outcome_repair(
+                context,
+                api_key=api_key,
+                model=model,
+                screenshot_path=screenshot_path,
+            )
+        except Exception as exc:
+            requests.append(
+                {
+                    "candidate_id": transition.get("candidate_id"),
+                    "path_id": failure.get("path_id"),
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        candidates, candidate_rejections = _normalize_outcome_repair_candidates(
+            payload=payload,
+            failure=failure,
+            parent_state=parent_state,
+        )
+        repair_candidates.extend(candidates)
+        rejected.extend(candidate_rejections)
+        requests.append(
+            {
+                "candidate_id": transition.get("candidate_id"),
+                "path_id": failure.get("path_id"),
+                "status": "completed",
+                "rationale": _clean_label(payload.get("rationale") or ""),
+                "abandoned_reason": _clean_label(payload.get("abandoned_reason") or ""),
+                "proposed_candidate_count": len(payload.get("repaired_workflow_candidates", [])),
+                "accepted_for_validation": len(candidates),
+            }
+        )
+
+    if not repair_candidates:
+        return {
+            "status": "completed",
+            "model": model,
+            "selected_failure_count": len(failures),
+            "attempted": 0,
+            "accepted": 0,
+            "results": [],
+            "requests": requests,
+            "rejected": rejected,
+        }
+
+    signatures = {
+        state.get("signature"): state.get("state_id")
+        for state in states
+        if state.get("signature") and state.get("state_id")
+    }
+    accepted, attempted, results = await _validate_workflow_candidates(
+        browser=browser,
+        start_url=start_url,
+        output_dir=output_dir,
+        states=states,
+        transitions=transitions,
+        viewport=viewport,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        timeout_ms=timeout_ms,
+        candidates=repair_candidates,
+        states_by_id=states_by_id,
+        signatures=signatures,
+        default_origin="llm_outcome_repair",
+    )
+    return {
+        "status": "completed",
+        "model": model,
+        "selected_failure_count": len(failures),
+        "attempted": attempted,
+        "accepted": accepted,
+        "results": results,
+        "requests": requests,
+        "rejected": rejected,
+    }
+
+
+def _repairable_outcome_failures(
+    candidate_paths: list[dict],
+    transitions: list[dict],
+    max_repairs: int,
+) -> list[dict]:
+    failures = []
+    seen = set()
+
+    for path in candidate_paths:
+        if len(failures) >= max(0, max_repairs):
+            break
+        if not _path_is_repairable_product_workflow(path):
+            continue
+        if _path_has_presentable_scan_outcome(path):
+            continue
+        transition = _repair_transition_for_path(path)
+        if not transition:
+            continue
+        key = transition.get("candidate_id") or path.get("path_id")
+        if key in seen:
+            continue
+        seen.add(key)
+        failures.append(
+            {
+                "path_id": path.get("path_id"),
+                "reason": "Workflow executed but did not expose a clear changed result for the demo.",
+                "path": path,
+                "transition": transition,
+            }
+        )
+
+    for transition in transitions:
+        if len(failures) >= max(0, max_repairs):
+            break
+        if transition.get("status") != "no_meaningful_outcome":
+            continue
+        key = transition.get("candidate_id")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        failures.append(
+            {
+                "path_id": None,
+                "reason": "Workflow was rejected because it only changed filled inputs or did not expose a result.",
+                "path": None,
+                "transition": _path_transition(transition),
+            }
+        )
+
+    return failures
+
+
+def _path_is_repairable_product_workflow(path: dict) -> bool:
+    kinds = set(path.get("kinds", []))
+    if {"llm_workflow", "llm_goal_workflow"} & kinds:
+        return True
+    action_types = set(path.get("action_types", []))
+    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
+
+
+def _repair_transition_for_path(path: dict) -> dict | None:
+    for transition in reversed(path.get("transitions", [])):
+        if _transition_is_product_workflow(transition):
+            return transition
+    return None
+
+
+def _transition_is_product_workflow(transition: dict) -> bool:
+    if transition.get("kind") in {"input_submit", "llm_workflow", "llm_goal_workflow"}:
+        return True
+    action_types = {action.get("type") for action in transition.get("actions", [])}
+    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
+
+
+def _path_has_presentable_scan_outcome(path: dict) -> bool:
+    return any(
+        _transition_has_presentable_scan_outcome(transition)
+        for transition in path.get("transitions", [])
+        if _transition_is_product_workflow(transition)
+    )
+
+
+def _transition_has_presentable_scan_outcome(transition: dict) -> bool:
+    summary = transition.get("outcome_summary") or {}
+    if summary.get("url_changed") or summary.get("added_text") or summary.get("removed_text") or summary.get("added_controls"):
+        return True
+
+    action_selectors = {
+        action.get("selector")
+        for action in transition.get("actions", [])
+        if action.get("type") in {"fill", "select"} and action.get("selector")
+    }
+    for control in summary.get("changed_controls") or []:
+        selectors = set(control.get("selectors") or [])
+        if selectors and selectors & action_selectors:
+            continue
+        for change in (control.get("changes") or {}).values():
+            before = str(change.get("before") or "").strip()
+            after = str(change.get("after") or "").strip()
+            if after and after != before:
+                return True
+    return False
+
+
+def _outcome_failure_screenshot_path(
+    output_dir: Path,
+    failure: dict,
+    parent_state: dict,
+    states_by_id: dict[str, dict],
+) -> str | None:
+    transition = failure.get("transition") or {}
+    to_state_id = transition.get("to")
+    to_state = states_by_id.get(to_state_id)
+    screenshot = ((to_state or {}).get("artifacts") or {}).get("screenshot")
+    if screenshot:
+        return screenshot
+
+    if to_state_id:
+        candidate_path = output_dir / f"{to_state_id}.png"
+        if candidate_path.exists():
+            return str(candidate_path)
+
+    return (parent_state.get("artifacts") or {}).get("screenshot")
+
+
+def _outcome_repair_context(start_url: str, failure: dict, parent_state: dict) -> dict:
+    transition = failure.get("transition") or {}
+    return {
+        "start_url": start_url,
+        "goal": "Repair a mechanically successful workflow so it produces a clear, visible changed output for a demo video.",
+        "failure_reason": failure.get("reason"),
+        "path": _candidate_path_for_audit(failure.get("path") or {}) if failure.get("path") else None,
+        "failed_transition": {
+            "candidate_id": transition.get("candidate_id"),
+            "label": transition.get("label"),
+            "kind": transition.get("kind"),
+            "goal": transition.get("goal"),
+            "expected_outcome": transition.get("expected_outcome"),
+            "feature": transition.get("feature"),
+            "feature_id": transition.get("feature_id"),
+            "actions": transition.get("actions", []),
+            "outcome_summary": _outcome_summary_for_audit(transition.get("outcome_summary")),
+        },
+        "parent_state": _state_for_audit(parent_state),
+        "requirements": [
+            "Return actions that replay from parent_state.state_id.",
+            "The repaired workflow must include a decisive submit/calculate/apply action when the app requires one.",
+            "The result must visibly change an output, result, preview, saved item, filtered list, status, or summary.",
+            "Do not return a workflow that only fills user inputs or focuses controls.",
+            "Avoid account, payment, destructive, feedback, and external navigation actions.",
+        ],
+        "supported_actions": ["observe", "click", "fill", "press", "select"],
+    }
+
+
+def _normalize_outcome_repair_candidates(
+    payload: dict,
+    failure: dict,
+    parent_state: dict,
+) -> tuple[list[dict], list[dict]]:
+    candidates = []
+    rejected = []
+    transition = failure.get("transition") or {}
+    original_candidate_id = transition.get("candidate_id") or failure.get("path_id") or "outcome"
+
+    for index, raw_candidate in enumerate(payload.get("repaired_workflow_candidates", [])[:MAX_LLM_OUTCOME_REPAIR_CANDIDATES], 1):
+        requested_parent_state_id = raw_candidate.get("parent_state_id")
+        if requested_parent_state_id and requested_parent_state_id != parent_state.get("state_id"):
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": f"Repair changed parent_state_id from {parent_state.get('state_id')} to {requested_parent_state_id}.",
+                }
+            )
+            continue
+
+        actions, errors = _normalize_llm_workflow_actions(raw_candidate, parent_state)
+        if errors:
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": "; ".join(errors),
+                }
+            )
+            continue
+        if not _is_meaningful_workflow(actions):
+            rejected.append(
+                {
+                    "candidate_id": original_candidate_id,
+                    "label": raw_candidate.get("label"),
+                    "reason": "Outcome repair must include fill/select and click/press actions.",
+                }
+            )
+            continue
+
+        label = _clean_label(raw_candidate.get("label") or f"Outcome repair {index}")
+        repair_strategy = _clean_label(raw_candidate.get("repair_strategy") or payload.get("rationale") or "")
+        candidates.append(
+            {
+                "candidate_id": f"outcome-repair:{original_candidate_id}:{index}:{_slug(label)}",
+                "parent_state_id": parent_state.get("state_id"),
+                "requested_parent_state_id": requested_parent_state_id or parent_state.get("state_id"),
+                "kind": "llm_goal_workflow",
+                "label": label,
+                "goal": _clean_label(raw_candidate.get("goal") or transition.get("goal") or label),
+                "expected_outcome": _clean_label(raw_candidate.get("expected_outcome") or transition.get("expected_outcome") or ""),
+                "feature_id": _slug(raw_candidate.get("feature_id") or transition.get("feature_id") or transition.get("feature") or label),
+                "feature": _clean_label(raw_candidate.get("feature") or transition.get("feature") or ""),
+                "confidence": _enum_value(raw_candidate.get("confidence"), {"high", "medium", "low"}, "medium"),
+                "repaired_from": original_candidate_id,
+                "repair_note": repair_strategy,
+                "origin": "llm_outcome_repair",
+                "priority": 5,
+                "bounds": {},
+                "actions": actions,
+            }
+        )
+
+    return candidates, rejected
+
+
 def _normalize_coverage_audit_payload(
     payload: dict,
     states_by_id: dict[str, dict],
@@ -1972,6 +2378,75 @@ def _call_openai_goal_repair(
     return json.loads(output_text)
 
 
+def _call_openai_outcome_repair(
+    context: dict,
+    api_key: str,
+    model: str,
+    screenshot_path: str | None,
+) -> dict:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    user_content = [
+        {
+            "type": "input_text",
+            "text": json.dumps(context, indent=2),
+        }
+    ]
+    image_url = _image_data_url(screenshot_path)
+    if image_url:
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": "low",
+            }
+        )
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": _llm_outcome_repair_prompt(),
+            },
+            {
+                "role": "user",
+                "content": user_content,
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "folio_outcome_repair",
+                "strict": True,
+                "schema": _llm_outcome_repair_schema(),
+            }
+        },
+        "max_output_tokens": 4_000,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180, context=_https_context()) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+
+    output_text = _extract_openai_output_text(body)
+    if not output_text:
+        raise RuntimeError("OpenAI response did not include output text.")
+
+    return json.loads(output_text)
+
+
 def _call_openai_coverage_audit(context: dict, api_key: str, model: str, max_workflows: int) -> dict:
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     payload = {
@@ -2102,6 +2577,22 @@ def _llm_goal_repair_prompt() -> str:
         "site chrome unless it is the product itself. If the workflow cannot be safely repaired with the supplied "
         "evidence, return an empty repaired_workflow_candidates array and a concise abandoned_reason. Return only JSON "
         "matching the schema."
+    )
+
+
+def _llm_outcome_repair_prompt() -> str:
+    return (
+        "You are Folio's outcome repair strategist. A workflow replayed without browser errors, but it failed as a "
+        "demo because it only filled inputs or did not expose a clear changed product result. Repair the workflow so "
+        "it produces a visible, presentable outcome: an output field, result text, generated preview, saved item, "
+        "filtered list, status, or summary that changes after the decisive action. The returned actions must replay "
+        "from the supplied parent_state_id, not from the after-state screenshot. Use only selectors present in the "
+        "parent_state context. Include the submit/calculate/apply/search/save action when the app needs one. Prefer "
+        "simple, reliable field values that satisfy required inputs and avoid impossible calculations or blank-output "
+        "cases. Do not return workflows that merely fill fields, focus controls, scroll, open site chrome, submit "
+        "feedback, use accounts/payments, or perform destructive actions. If the supplied state cannot produce a "
+        "clear result safely, return an empty repaired_workflow_candidates array and explain abandoned_reason. Return "
+        "only JSON matching the schema."
     )
 
 
@@ -2724,6 +3215,65 @@ def _llm_goal_repair_schema() -> dict:
                         "label": {"type": "string"},
                         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                         "repair_strategy": {"type": "string"},
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_LLM_EXPANSION_ACTIONS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "description": {"type": "string"},
+                                    "selector": {"type": ["string", "null"]},
+                                    "value": {"type": ["string", "null"]},
+                                    "key": {"type": ["string", "null"]},
+                                    "allow_hidden": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "abandoned_reason": {"type": "string"},
+        },
+    }
+
+
+def _llm_outcome_repair_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rationale", "repaired_workflow_candidates", "abandoned_reason"],
+        "properties": {
+            "rationale": {"type": "string"},
+            "repaired_workflow_candidates": {
+                "type": "array",
+                "maxItems": MAX_LLM_OUTCOME_REPAIR_CANDIDATES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "parent_state_id",
+                        "label",
+                        "feature",
+                        "feature_id",
+                        "confidence",
+                        "repair_strategy",
+                        "goal",
+                        "expected_outcome",
+                        "actions",
+                    ],
+                    "properties": {
+                        "parent_state_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "feature": {"type": "string"},
+                        "feature_id": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "repair_strategy": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "expected_outcome": {"type": "string"},
                         "actions": {
                             "type": "array",
                             "minItems": 1,
