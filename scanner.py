@@ -62,27 +62,70 @@ STATE_CHANGING_KIND_BONUSES = {
     "llm_workflow": 24,
     "llm_goal_workflow": 24,
 }
-RISK_WORDS = {
+HIGH_RISK_WORDS = {
     "account",
     "billing",
     "buy",
-    "cancel",
     "checkout",
-    "clear",
-    "delete",
+    "credentials",
     "fdbk",
     "feedback",
     "invite",
     "logout",
+    "password",
     "pay",
     "payment",
     "purchase",
-    "remove",
-    "reset",
     "send",
     "sign out",
     "subscribe",
+    "token",
 }
+CONDITIONAL_RISK_WORDS = {
+    "cancel",
+    "clear",
+    "delete",
+    "remove",
+    "reset",
+}
+SAFE_LOCAL_PRODUCT_ACTION_TERMS = {
+    "active",
+    "calculator",
+    "clear completed",
+    "clear-completed",
+    "complete",
+    "completed",
+    "destroy",
+    "entry",
+    "field",
+    "filter",
+    "form",
+    "input",
+    "item",
+    "list",
+    "note",
+    "row",
+    "selection",
+    "task",
+    "todo",
+    "todo-item",
+}
+CLICK_ONLY_WORKFLOW_TERMS = SAFE_LOCAL_PRODUCT_ACTION_TERMS | {
+    "apply",
+    "calculate",
+    "compute",
+    "convert",
+    "export",
+    "mode",
+    "option",
+    "preview",
+    "save",
+    "sort",
+    "tab",
+    "toggle",
+    "view",
+}
+RISK_WORDS = HIGH_RISK_WORDS | CONDITIONAL_RISK_WORDS
 
 
 def build_job_id(url: str) -> str:
@@ -1465,12 +1508,12 @@ def _normalize_goal_repair_candidates(
                 }
             )
             continue
-        if not _is_meaningful_workflow(actions):
+        if not _is_meaningful_workflow(actions, raw_candidate):
             rejected.append(
                 {
                     "candidate_id": original_candidate_id,
                     "label": raw_candidate.get("label"),
-                    "reason": "Repaired workflow must include fill/select and click/press actions.",
+                    "reason": "Repaired workflow must include a form submission or safe in-app click workflow.",
                 }
             )
             continue
@@ -1988,12 +2031,12 @@ def _normalize_outcome_repair_candidates(
                 }
             )
             continue
-        if not _is_meaningful_workflow(actions):
+        if not _is_meaningful_workflow(actions, raw_candidate):
             rejected.append(
                 {
                     "candidate_id": original_candidate_id,
                     "label": raw_candidate.get("label"),
-                    "reason": "Outcome repair must include fill/select and click/press actions.",
+                    "reason": "Outcome repair must include a form submission or safe in-app click workflow.",
                 }
             )
             continue
@@ -2130,13 +2173,13 @@ def _normalize_coverage_audit_workflow_candidates(
                 }
             )
             continue
-        if not _is_meaningful_workflow(actions):
+        if not _is_meaningful_workflow(actions, raw_candidate):
             rejected.append(
                 {
                     "label": raw_candidate.get("label"),
                     "feature_id": raw_candidate.get("feature_id"),
                     "parent_state_id": requested_parent_state_id,
-                    "reason": "Workflow candidate must include fill/select and click/press actions.",
+                    "reason": "Workflow candidate must include a form submission or safe in-app click workflow.",
                 }
             )
             continue
@@ -2538,7 +2581,8 @@ def _llm_workflow_expander_prompt() -> str:
         "You are Folio's workflow expansion strategist. Propose a small number of safe, bounded browser workflows "
         "that demonstrate core app functionality missing from the current scanner-tested candidate paths. Use only "
         "state_id values and selectors provided in the context. Prefer main content workflows that create, calculate, "
-        "filter, save, search, preview, or otherwise produce visible product outcomes. Use select actions for select/dropdown "
+        "filter, toggle, save, search, preview, clear local completed items, delete local in-app items, or otherwise "
+        "produce visible product outcomes. Use select actions for select/dropdown "
         "elements. Avoid feedback forms, generic "
         "site search, legal/account/navigation/footer/header actions unless those are the actual product. Return only "
         "JSON matching the schema. If a workflow starts from a discovered tool page, set parent_state_id to that "
@@ -2555,6 +2599,8 @@ def _llm_exploration_goal_prompt() -> str:
         "Use the provided states, candidate paths, source hints, routes, text, forms, and selectors. Distinguish "
         "validated workflows from missing or partially discovered functionality. Prefer core product workflows over "
         "generic search, feedback, legal, account, header, footer, and site navigation unless those are the product. "
+        "Safe local mutations such as completing, filtering, clearing completed local items, deleting an in-app item, "
+        "or resetting a calculator/form can be valid core workflows when they produce visible results. "
         "If you propose browser actions, use only selectors present in the provided state context and set the correct "
         "parent_state_id. If a feature appears important but no usable selectors or state are available, return it as "
         "needs_discovery with blockers instead of inventing selectors. Return only JSON matching the schema. Folio "
@@ -2573,7 +2619,8 @@ def _llm_goal_repair_prompt() -> str:
         "selectors provided in parent_state or failure.visible_context. Prefer changing the smallest useful part of "
         "the workflow: replace hidden or stale controls with visible controls, switch fill/select action types when "
         "the DOM evidence shows a better control type, and add an observe action only when the UI needs a short pause. "
-        "Do not invent selectors, do not use destructive/account/payment/navigation actions, and do not chase generic "
+        "Do not invent selectors, do not use account/payment/navigation actions or destructive actions outside the "
+        "local product surface, and do not chase generic "
         "site chrome unless it is the product itself. If the workflow cannot be safely repaired with the supplied "
         "evidence, return an empty repaired_workflow_candidates array and a concise abandoned_reason. Return only JSON "
         "matching the schema."
@@ -2590,7 +2637,9 @@ def _llm_outcome_repair_prompt() -> str:
         "parent_state context. Include the submit/calculate/apply/search/save action when the app needs one. Prefer "
         "simple, reliable field values that satisfy required inputs and avoid impossible calculations or blank-output "
         "cases. Do not return workflows that merely fill fields, focus controls, scroll, open site chrome, submit "
-        "feedback, use accounts/payments, or perform destructive actions. If the supplied state cannot produce a "
+        "feedback, use accounts/payments, or perform destructive actions outside the local product surface. Safe local "
+        "mutations such as clearing completed items, deleting a local item, or resetting a calculator/form are allowed "
+        "when they are the app's feature and produce a visible result. If the supplied state cannot produce a "
         "clear result safely, return an empty repaired_workflow_candidates array and explain abandoned_reason. Return "
         "only JSON matching the schema."
     )
@@ -2603,8 +2652,9 @@ def _llm_coverage_audit_prompt() -> str:
         "what is still missing or under-covered, and which existing paths are low-value navigation or site chrome. "
         "Propose only safe, bounded workflows that address missing core product functionality and can replay from one "
         "of the provided state_id values using selectors present in that state. Prefer workflows that calculate, create, "
-        "transform, filter, preview, export, save locally, or otherwise produce visible in-app outcomes. Avoid feedback, "
-        "contact, account, payment, destructive, legal, header, footer, generic search, and external navigation unless "
+        "transform, filter, preview, export, save locally, clear completed local items, delete local in-app items, "
+        "reset calculators/forms, or otherwise produce visible in-app outcomes. Avoid feedback, "
+        "contact, account, payment, destructive actions outside the local product surface, legal, header, footer, generic search, and external navigation unless "
         "the scanned app is specifically about that function. Do not duplicate already validated workflows unless the "
         "new workflow covers a meaningfully different mode, input type, branch, or result surface. If an important "
         "feature has usable selectors, propose a workflow for it until max_workflow_candidates is reached; do not stop "
@@ -3467,8 +3517,8 @@ def _normalize_llm_workflow_candidates(
         if errors:
             rejected.append(_rejected_llm_candidate(raw_candidate, "; ".join(errors)))
             continue
-        if not _is_meaningful_workflow(actions):
-            rejected.append(_rejected_llm_candidate(raw_candidate, "Workflow must include a fill action and a click or press action."))
+        if not _is_meaningful_workflow(actions, raw_candidate):
+            rejected.append(_rejected_llm_candidate(raw_candidate, "Workflow must include a form submission or safe in-app click workflow."))
             continue
 
         label = _clean_label(raw_candidate.get("label") or f"LLM workflow {index}")
@@ -3602,13 +3652,13 @@ def _normalize_goal_workflow_candidates(
                 }
             )
             continue
-        if not _is_meaningful_workflow(actions):
+        if not _is_meaningful_workflow(actions, raw_candidate):
             rejected.append(
                 {
                     "goal_id": goal_id,
                     "label": raw_candidate.get("label"),
                     "parent_state_id": requested_parent_state_id,
-                    "reason": "Workflow candidate must include fill/select and click/press actions.",
+                    "reason": "Workflow candidate must include a form submission or safe in-app click workflow.",
                 }
             )
             continue
@@ -3704,9 +3754,11 @@ def _normalize_llm_workflow_actions(
             if action_type == "fill" and (element.get("tag") or "").lower() == "select":
                 action_type = "select"
                 action["type"] = "select"
-            if action_type == "click" and _click_action_is_risky(element, parent_state):
-                errors.append(f"Risky click selector at {index}: {selector}")
-                continue
+            if action_type == "click":
+                risk_reason = _click_action_risk_reason(element, parent_state, action, raw_candidate, selector)
+                if risk_reason:
+                    errors.append(f"Risky click selector at {index}: {selector} ({risk_reason})")
+                    continue
             action["selector"] = selector
         if action_type in {"fill", "select"}:
             value = str(raw_action.get("value") or "").strip()
@@ -3790,18 +3842,90 @@ def _selectors_for_visible_context(context: dict) -> dict[str, dict]:
     return selector_map
 
 
-def _click_action_is_risky(element: dict, state: dict) -> bool:
-    label = _element_name(element).lower()
-    if _has_risk_word(label):
-        return True
+def _click_action_risk_reason(
+    element: dict,
+    state: dict,
+    action: dict | None = None,
+    candidate: dict | None = None,
+    selector: str | None = None,
+) -> str | None:
+    action_text = _workflow_policy_text([action] if action else [], element=element, selector=selector)
+    full_text = _workflow_policy_text([action] if action else [], candidate, element=element, selector=selector)
+    if _has_high_risk_word(action_text) or (
+        _has_high_risk_word(full_text) and not _has_safe_local_product_context(action_text)
+    ):
+        return "high-risk account/payment/feedback wording"
+    if _has_conditional_risk_word(full_text) and not _has_safe_local_product_context(full_text):
+        return "mutation wording without local product context"
     href = element.get("href")
     state_url = state.get("url")
-    return bool(href and state_url and not _is_same_app_scope_url(href, state_url))
+    if href and state_url and not _is_same_app_scope_url(href, state_url):
+        return "external navigation"
+    return None
 
 
-def _is_meaningful_workflow(actions: list[dict]) -> bool:
+def _click_action_is_risky(element: dict, state: dict) -> bool:
+    return _click_action_risk_reason(element, state) is not None
+
+
+def _is_meaningful_workflow(actions: list[dict], candidate: dict | None = None) -> bool:
     action_types = {action.get("type") for action in actions}
-    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
+    if bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types):
+        return True
+    return _has_safe_click_only_workflow_intent(actions, candidate)
+
+
+def _has_safe_click_only_workflow_intent(actions: list[dict], candidate: dict | None = None) -> bool:
+    if not any(action.get("type") in {"click", "press"} for action in actions):
+        return False
+
+    text = _workflow_policy_text(actions, candidate)
+    if _has_high_risk_word(text):
+        return False
+    if _has_conditional_risk_word(text):
+        return _has_safe_local_product_context(text)
+    return _has_policy_word(text, CLICK_ONLY_WORKFLOW_TERMS)
+
+
+def _workflow_policy_text(
+    actions: list[dict],
+    candidate: dict | None = None,
+    element: dict | None = None,
+    selector: str | None = None,
+) -> str:
+    parts: list[str] = []
+    if candidate:
+        for key in ("label", "goal", "expected_outcome", "feature", "feature_id", "hypothesis", "repair_strategy"):
+            parts.append(str(candidate.get(key) or ""))
+    for action in actions:
+        if not action:
+            continue
+        for key in ("description", "selector", "key"):
+            parts.append(str(action.get(key) or ""))
+    if selector:
+        parts.append(selector)
+    if element:
+        attrs = element.get("attributes") or {}
+        parts.extend(
+            [
+                _element_name(element),
+                str(element.get("tag") or ""),
+                str(element.get("type") or ""),
+                str(element.get("role") or ""),
+                " ".join(element.get("selectors") or []),
+                str(element.get("href") or ""),
+                str(attrs.get("id") or ""),
+                str(attrs.get("title") or ""),
+                str(attrs.get("placeholder") or ""),
+                str(attrs.get("aria_label") or ""),
+                " ".join(attrs.get("class_names") or []),
+            ]
+        )
+    return re.sub(r"\s+", " ", " ".join(parts).lower()).strip()
+
+
+def _has_safe_local_product_context(text: str) -> bool:
+    return not _has_high_risk_word(text) and _has_policy_word(text, SAFE_LOCAL_PRODUCT_ACTION_TERMS)
 
 
 def _rejected_llm_candidate(candidate: dict, reason: str) -> dict:
@@ -4309,8 +4433,28 @@ def _is_disabled(element: dict) -> bool:
 
 
 def _has_risk_word(label: str) -> bool:
-    normalized = re.sub(r"\s+", " ", label.lower())
-    return any(word in normalized for word in RISK_WORDS)
+    return _has_policy_word(label, RISK_WORDS)
+
+
+def _has_high_risk_word(label: str) -> bool:
+    return _has_policy_word(label, HIGH_RISK_WORDS)
+
+
+def _has_conditional_risk_word(label: str) -> bool:
+    return _has_policy_word(label, CONDITIONAL_RISK_WORDS)
+
+
+def _has_policy_word(label: str, words: set[str]) -> bool:
+    normalized = re.sub(r"\s+", " ", str(label or "").lower())
+    for word in words:
+        needle = word.lower()
+        if " " in needle or "-" in needle:
+            if needle in normalized:
+                return True
+            continue
+        if re.search(rf"\b{re.escape(needle)}\b", normalized):
+            return True
+    return False
 
 
 def _is_same_origin(href: str, start_url: str) -> bool:
