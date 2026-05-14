@@ -20,6 +20,7 @@ MAX_LLM_TEXT_BLOCKS = 40
 MAX_LLM_INTERACTIVE_ELEMENTS = 60
 MIN_LLM_COVERAGE_SCORE = 0.65
 MIN_LLM_PRODUCT_WORKFLOW_SCORE = 0.45
+REDUNDANT_PREFIX_SCORE_MARGIN = 0.08
 GENERIC_FEATURE_LABELS = {
     "about",
     "calculators",
@@ -696,24 +697,14 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
     path_items = [item for item in path_items if item]
     path_items.sort(key=lambda item: (item["demo_value_score"], item["heuristic_score"]), reverse=True)
 
-    covered_features = []
+    selected_items = []
     uncovered_features_by_id = {}
     selected_path_ids = []
     for item in path_items:
         force_selected = selected_path_id and item["path_id"] == selected_path_id
         if _coverage_item_is_selected(item, force_selected=force_selected):
             selected_path_ids.append(item["path_id"])
-            covered_features.append(
-                {
-                    "feature_id": item["feature_id"],
-                    "title": item["feature_title"],
-                    "path_id": item["path_id"],
-                    "demo_value_score": item["demo_value_score"],
-                    "reason": item["reason"],
-                    "quality_tags": item["quality_tags"],
-                    "workflow_kind": item["workflow_kind"],
-                }
-            )
+            selected_items.append(item)
             continue
 
         if _coverage_item_is_uncovered(item):
@@ -728,6 +719,21 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
             )
             uncovered["candidate_path_ids"].append(item["path_id"])
 
+    redundant_paths = []
+    if selected_path_ids:
+        paths_by_id = {path.get("path_id"): path for path in paths if path.get("path_id")}
+        selected_path_ids, redundant_paths = _prune_redundant_prefix_path_ids(
+            selected_path_ids,
+            selected_items,
+            paths_by_id,
+        )
+
+    selected_path_id_set = set(selected_path_ids)
+    covered_features = [
+        _coverage_feature_for_item(item)
+        for item in selected_items
+        if item["path_id"] in selected_path_id_set
+    ]
     covered_feature_ids = {feature["feature_id"] for feature in covered_features}
     uncovered_features = [
         feature
@@ -735,7 +741,6 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         if feature_id not in covered_feature_ids
     ]
     if selected_path_ids:
-        paths_by_id = {path.get("path_id"): path for path in paths if path.get("path_id")}
         selected_path_ids = _presentation_ordered_path_ids(
             selected_path_ids,
             paths_by_id,
@@ -756,6 +761,7 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         "covered_features": covered_features,
         "uncovered_features": uncovered_features,
         "missing_workflows": missing_workflows,
+        "redundant_paths": redundant_paths,
         "rejected_paths": [
             {"path_id": path_id, "reason": reason}
             for path_id, reason in rejected_map.items()
@@ -763,6 +769,112 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         "candidate_path_count": len(paths),
         "selected_path_count": len(selected_path_ids),
     }
+
+
+def _coverage_feature_for_item(item: dict) -> dict:
+    return {
+        "feature_id": item["feature_id"],
+        "title": item["feature_title"],
+        "path_id": item["path_id"],
+        "demo_value_score": item["demo_value_score"],
+        "reason": item["reason"],
+        "quality_tags": item["quality_tags"],
+        "workflow_kind": item["workflow_kind"],
+    }
+
+
+def _prune_redundant_prefix_path_ids(
+    selected_path_ids: list[str],
+    selected_items: list[dict],
+    paths_by_id: dict[str, dict],
+) -> tuple[list[str], list[dict]]:
+    item_by_id = {item["path_id"]: item for item in selected_items}
+    pruned_by: dict[str, str] = {}
+    for path_id in selected_path_ids:
+        covering_path_id = _covering_prefix_path_id(path_id, selected_path_ids, item_by_id, paths_by_id)
+        if covering_path_id:
+            pruned_by[path_id] = covering_path_id
+
+    kept_path_ids = [path_id for path_id in selected_path_ids if path_id not in pruned_by]
+    redundant_paths = [
+        {
+            "path_id": path_id,
+            "covered_by_path_id": covered_by_path_id,
+            "reason": "A selected richer workflow contains this path as its opening sequence.",
+        }
+        for path_id, covered_by_path_id in pruned_by.items()
+    ]
+    return kept_path_ids, redundant_paths
+
+
+def _covering_prefix_path_id(
+    path_id: str,
+    selected_path_ids: list[str],
+    item_by_id: dict[str, dict],
+    paths_by_id: dict[str, dict],
+) -> str | None:
+    path = paths_by_id.get(path_id)
+    item = item_by_id.get(path_id)
+    if not path or not item or item.get("workflow_kind") != "product_workflow":
+        return None
+
+    signature = _path_transition_signature(path)
+    if not signature:
+        return None
+
+    candidates = []
+    for other_path_id in selected_path_ids:
+        if other_path_id == path_id:
+            continue
+        other_path = paths_by_id.get(other_path_id)
+        other_item = item_by_id.get(other_path_id)
+        if not other_path or not other_item:
+            continue
+        if other_item.get("feature_id") != item.get("feature_id"):
+            continue
+        if other_item.get("workflow_kind") != "product_workflow":
+            continue
+        if other_item.get("demo_value_score", 0) + REDUNDANT_PREFIX_SCORE_MARGIN < item.get("demo_value_score", 0):
+            continue
+        other_signature = _path_transition_signature(other_path)
+        if len(other_signature) <= len(signature):
+            continue
+        if other_signature[: len(signature)] != signature:
+            continue
+        candidates.append(other_path_id)
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda candidate_id: (
+            item_by_id.get(candidate_id, {}).get("demo_value_score", 0),
+            len(paths_by_id.get(candidate_id, {}).get("transitions", [])),
+        ),
+    )
+
+
+def _path_transition_signature(path: dict) -> list[tuple]:
+    return [_transition_signature(transition) for transition in path.get("transitions", [])]
+
+
+def _transition_signature(transition: dict) -> tuple:
+    actions = tuple(
+        (
+            action.get("type"),
+            action.get("selector"),
+            str(action.get("value") or ""),
+            str(action.get("key") or ""),
+        )
+        for action in transition.get("actions", [])
+    )
+    return (
+        transition.get("kind"),
+        _clean_transition_label(transition.get("label") or ""),
+        transition.get("to"),
+        actions,
+    )
 
 
 def _coverage_path_item(path: dict, rank_item: dict | None, rejected_reason: str | None) -> dict:
