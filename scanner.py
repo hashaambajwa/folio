@@ -56,6 +56,11 @@ MAX_LLM_COVERAGE_AUDIT_FEATURES = 16
 MAX_LLM_OUTCOME_REPAIRS = 4
 MAX_LLM_OUTCOME_REPAIR_CANDIDATES = 2
 PROBE_ACTION_TIMEOUT_MS = 8_000
+LLM_ACTION_TYPES = ["observe", "click", "double_click", "fill", "press", "select"]
+SELECTOR_LLM_ACTION_TYPES = {"click", "double_click", "fill", "press", "select"}
+POINTER_LLM_ACTION_TYPES = {"click", "double_click"}
+REVEALING_LLM_ACTION_TYPES = {"click", "double_click", "press", "select"}
+POST_REVEAL_DYNAMIC_SELECTOR_ACTION_TYPES = {"fill", "press", "select"}
 STATE_CHANGING_KIND_BONUSES = {
     "input_submit": 6,
     "toggle": 8,
@@ -97,12 +102,15 @@ SAFE_LOCAL_PRODUCT_ACTION_TERMS = {
     "completed",
     "destroy",
     "entry",
+    "edit",
+    "editing",
     "field",
     "filter",
     "form",
     "input",
     "item",
     "list",
+    "label",
     "note",
     "row",
     "selection",
@@ -868,7 +876,7 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
         try:
             action_type = action["type"]
             selector = action.get("selector")
-            if action_type in {"click", "fill", "press", "select"}:
+            if action_type in SELECTOR_LLM_ACTION_TYPES:
                 if not selector:
                     return {
                         "status": "failed",
@@ -896,6 +904,8 @@ async def _execute_probe_actions(page, actions: list[dict]) -> dict:
                             "(selector) => document.querySelector(selector)?.click()",
                             selector,
                         )
+            elif action_type == "double_click":
+                await locator.dblclick(timeout=PROBE_ACTION_TIMEOUT_MS)
             elif action_type == "fill":
                 await locator.fill(action.get("value", ""), timeout=PROBE_ACTION_TIMEOUT_MS)
             elif action_type == "select":
@@ -1426,10 +1436,11 @@ def _goal_repair_context(
     return {
         "start_url": start_url,
         "task": "Repair a single failed workflow so it can be replayed from the original parent state and validated by Playwright.",
-        "supported_actions": ["observe", "click", "fill", "press", "select"],
+        "supported_actions": LLM_ACTION_TYPES,
         "rules": [
             "Use only selectors from parent_state or failure.visible_context.",
-            "Return the full repaired action sequence from the original parent_state, including prerequisite clicks that reveal later controls.",
+            "Return only actions that should run after parent_state.replay_actions; do not repeat those parent replay actions.",
+            "Include prerequisite clicks or double_clicks only when they happen after the parent state and reveal later controls.",
             "Do not repeat a selector that failed because it was hidden or detached when a visible replacement selector exists.",
             "Prefer visible form fields and result-producing controls over navigation, site search, footer links, account flows, destructive actions, or ads.",
             "If the workflow cannot be repaired safely with the supplied selectors, return no repaired workflow candidates and explain why.",
@@ -1901,7 +1912,7 @@ def _path_is_repairable_product_workflow(path: dict) -> bool:
     if {"llm_workflow", "llm_goal_workflow"} & kinds:
         return True
     action_types = set(path.get("action_types", []))
-    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
+    return bool({"fill", "select"} & action_types) and bool({"click", "double_click", "press"} & action_types)
 
 
 def _repair_transition_for_path(path: dict) -> dict | None:
@@ -1915,7 +1926,7 @@ def _transition_is_product_workflow(transition: dict) -> bool:
     if transition.get("kind") in {"input_submit", "llm_workflow", "llm_goal_workflow"}:
         return True
     action_types = {action.get("type") for action in transition.get("actions", [])}
-    return bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types)
+    return bool({"fill", "select"} & action_types) and bool({"click", "double_click", "press"} & action_types)
 
 
 def _path_has_presentable_scan_outcome(path: dict) -> bool:
@@ -1995,7 +2006,7 @@ def _outcome_repair_context(start_url: str, failure: dict, parent_state: dict) -
             "Do not return a workflow that only fills user inputs or focuses controls.",
             "Avoid account, payment, destructive, feedback, and external navigation actions.",
         ],
-        "supported_actions": ["observe", "click", "fill", "press", "select"],
+        "supported_actions": LLM_ACTION_TYPES,
     }
 
 
@@ -2582,12 +2593,15 @@ def _llm_workflow_expander_prompt() -> str:
         "that demonstrate core app functionality missing from the current scanner-tested candidate paths. Use only "
         "state_id values and selectors provided in the context. Prefer main content workflows that create, calculate, "
         "filter, toggle, save, search, preview, clear local completed items, delete local in-app items, or otherwise "
-        "produce visible product outcomes. Use select actions for select/dropdown "
+        "produce visible product outcomes. Use double_click for safe in-app edit/reveal gestures when the UI or text "
+        "explicitly indicates double-click editing. A fill/press selector may appear only after an earlier click or "
+        "double_click if the workflow is exposing an edit field or similar local control. Use select actions for select/dropdown "
         "elements. Avoid feedback forms, generic "
         "site search, legal/account/navigation/footer/header actions unless those are the actual product. Return only "
         "JSON matching the schema. If a workflow starts from a discovered tool page, set parent_state_id to that "
         "tool page's state and include only actions that can run from that state; do not include navigation actions "
-        "from the start page. Prefer simple text/number fields plus a Calculate, Apply, Search, Save, or Submit button "
+        "from the start page. Actions run after Folio replays the parent state, so do not repeat parent_state replay actions. "
+        "Prefer simple text/number fields plus a Calculate, Apply, Search, Save, or Submit button "
         "over complex selects when both are available. Folio will validate every proposed action in Playwright before using it."
     )
 
@@ -2601,8 +2615,11 @@ def _llm_exploration_goal_prompt() -> str:
         "generic search, feedback, legal, account, header, footer, and site navigation unless those are the product. "
         "Safe local mutations such as completing, filtering, clearing completed local items, deleting an in-app item, "
         "or resetting a calculator/form can be valid core workflows when they produce visible results. "
+        "Use double_click for safe in-app editing gestures when page text or DOM evidence indicates double-click editing; "
+        "selectors for fields revealed by that double_click may be included as later fill/press actions and will be validated in Playwright. "
         "If you propose browser actions, use only selectors present in the provided state context and set the correct "
-        "parent_state_id. If a feature appears important but no usable selectors or state are available, return it as "
+        "parent_state_id. Actions run after Folio has replayed that parent state's replay_actions, so do not repeat them. "
+        "If a feature appears important but no usable selectors or state are available, return it as "
         "needs_discovery with blockers instead of inventing selectors. Return only JSON matching the schema. Folio "
         "will treat every workflow candidate as untrusted until Playwright validates it. Keep each description, "
         "hypothesis, evidence item, blocker, and outcome concise. For already validated features, include workflow "
@@ -2615,10 +2632,12 @@ def _llm_goal_repair_prompt() -> str:
         "You are Folio's workflow repair strategist. A Playwright-validated product workflow failed after partial "
         "execution. Use the original parent state, failure DOM context, exact error, completed actions, failed action, "
         "and screenshot to repair the workflow. The returned actions must replay from the original parent_state_id, "
-        "not from the failure state, so include any prerequisite action that reveals controls used later. Use only "
+        "not from the failure state; do not repeat parent_state.replay_actions because Folio replays them before your actions. "
+        "Include only prerequisite actions after the parent state that reveal controls used later. Use only "
         "selectors provided in parent_state or failure.visible_context. Prefer changing the smallest useful part of "
         "the workflow: replace hidden or stale controls with visible controls, switch fill/select action types when "
-        "the DOM evidence shows a better control type, and add an observe action only when the UI needs a short pause. "
+        "the DOM evidence shows a better control type, use double_click when the UI requires it to enter edit mode, "
+        "and add an observe action only when the UI needs a short pause. "
         "Do not invent selectors, do not use account/payment/navigation actions or destructive actions outside the "
         "local product surface, and do not chase generic "
         "site chrome unless it is the product itself. If the workflow cannot be safely repaired with the supplied "
@@ -2634,7 +2653,9 @@ def _llm_outcome_repair_prompt() -> str:
         "it produces a visible, presentable outcome: an output field, result text, generated preview, saved item, "
         "filtered list, status, or summary that changes after the decisive action. The returned actions must replay "
         "from the supplied parent_state_id, not from the after-state screenshot. Use only selectors present in the "
-        "parent_state context. Include the submit/calculate/apply/search/save action when the app needs one. Prefer "
+        "parent_state context, except for fields revealed by an earlier safe click or double_click in the same workflow. "
+        "Do not repeat parent_state.replay_actions because Folio replays them before your actions. "
+        "Include the submit/calculate/apply/search/save action when the app needs one. Prefer "
         "simple, reliable field values that satisfy required inputs and avoid impossible calculations or blank-output "
         "cases. Do not return workflows that merely fill fields, focus controls, scroll, open site chrome, submit "
         "feedback, use accounts/payments, or perform destructive actions outside the local product surface. Safe local "
@@ -2653,14 +2674,16 @@ def _llm_coverage_audit_prompt() -> str:
         "Propose only safe, bounded workflows that address missing core product functionality and can replay from one "
         "of the provided state_id values using selectors present in that state. Prefer workflows that calculate, create, "
         "transform, filter, preview, export, save locally, clear completed local items, delete local in-app items, "
-        "reset calculators/forms, or otherwise produce visible in-app outcomes. Avoid feedback, "
+        "reset calculators/forms, edit existing local items via double_click when indicated, or otherwise produce visible in-app outcomes. "
+        "Fields revealed by an earlier safe double_click may be used as later fill/press actions. Avoid feedback, "
         "contact, account, payment, destructive actions outside the local product surface, legal, header, footer, generic search, and external navigation unless "
         "the scanned app is specifically about that function. Do not duplicate already validated workflows unless the "
         "new workflow covers a meaningfully different mode, input type, branch, or result surface. If an important "
         "feature has usable selectors, propose a workflow for it until max_workflow_candidates is reached; do not stop "
         "after only two or three workflows when more safe product features are reachable. If an important feature cannot "
         "be safely reached with the current selectors, report it as a missing feature with blockers instead of inventing "
-        "selectors. Every high- or medium-priority missing_features item with empty blockers must have at least one "
+        "selectors. Candidate actions run after Folio has replayed the parent state's replay_actions, so do not repeat them. "
+        "Every high- or medium-priority missing_features item with empty blockers must have at least one "
         "workflow_candidates item using the same feature_id. If no safe candidate can be created, keep the feature in "
         "missing_features but include concrete blockers. Folio will validate every workflow candidate in Playwright before using it. "
         "Return only JSON matching the schema."
@@ -2700,7 +2723,7 @@ def _workflow_expansion_context(
             _state_for_expander(state)
             for state in states[:MAX_LLM_EXPANSION_STATES]
         ],
-        "supported_actions": ["observe", "click", "fill", "press", "select"],
+        "supported_actions": LLM_ACTION_TYPES,
     }
 
 
@@ -2717,7 +2740,7 @@ def _exploration_goal_context(
         "limits": {
             "max_goals": max_goals,
             "max_workflow_candidates_per_goal": MAX_LLM_GOAL_WORKFLOWS,
-            "supported_actions": ["observe", "click", "fill", "press", "select"],
+            "supported_actions": LLM_ACTION_TYPES,
         },
         "source_context": _source_context_for_expander(source_context),
         "candidate_paths": [
@@ -2745,7 +2768,7 @@ def _coverage_audit_context(
         "goal": "Audit validated app-functionality coverage and propose only missing, high-value workflows.",
         "limits": {
             "max_workflow_candidates": max_workflows,
-            "supported_actions": ["observe", "click", "fill", "press", "select"],
+            "supported_actions": LLM_ACTION_TYPES,
         },
         "source_context": _source_context_for_expander(source_context),
         "exploration_goals": _exploration_goals_for_audit(exploration_goals),
@@ -3074,7 +3097,7 @@ def _llm_workflow_expansion_schema() -> dict:
                                 "additionalProperties": False,
                                 "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "type": {"type": "string", "enum": LLM_ACTION_TYPES},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -3211,7 +3234,7 @@ def _llm_exploration_goal_schema(max_goals: int) -> dict:
                                             "additionalProperties": False,
                                             "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                             "properties": {
-                                                "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                                "type": {"type": "string", "enum": LLM_ACTION_TYPES},
                                                 "description": {"type": "string"},
                                                 "selector": {"type": ["string", "null"]},
                                                 "value": {"type": ["string", "null"]},
@@ -3274,7 +3297,7 @@ def _llm_goal_repair_schema() -> dict:
                                 "additionalProperties": False,
                                 "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "type": {"type": "string", "enum": LLM_ACTION_TYPES},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -3333,7 +3356,7 @@ def _llm_outcome_repair_schema() -> dict:
                                 "additionalProperties": False,
                                 "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "type": {"type": "string", "enum": LLM_ACTION_TYPES},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -3460,7 +3483,7 @@ def _llm_coverage_audit_schema(max_workflows: int) -> dict:
                                 "additionalProperties": False,
                                 "required": ["type", "description", "selector", "value", "key", "allow_hidden"],
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["observe", "click", "fill", "press", "select"]},
+                                    "type": {"type": "string", "enum": LLM_ACTION_TYPES},
                                     "description": {"type": "string"},
                                     "selector": {"type": ["string", "null"]},
                                     "value": {"type": ["string", "null"]},
@@ -3734,7 +3757,7 @@ def _normalize_llm_workflow_actions(
     errors = []
     for index, raw_action in enumerate(raw_candidate.get("actions", [])[:MAX_LLM_EXPANSION_ACTIONS], 1):
         action_type = raw_action.get("type")
-        if action_type not in {"observe", "click", "fill", "press", "select"}:
+        if action_type not in LLM_ACTION_TYPES:
             errors.append(f"Unsupported action type at {index}: {action_type}")
             continue
 
@@ -3744,22 +3767,29 @@ def _normalize_llm_workflow_actions(
             "origin": "llm",
         }
         selector = raw_action.get("selector")
-        if action_type in {"click", "fill", "press", "select"}:
-            if not selector or selector not in selector_map:
-                if drop_unavailable:
-                    continue
+        if action_type in SELECTOR_LLM_ACTION_TYPES:
+            if not selector:
                 errors.append(f"Selector is not available in parent state at {index}: {selector}")
                 continue
-            element = selector_map[selector]
-            if action_type == "fill" and (element.get("tag") or "").lower() == "select":
-                action_type = "select"
-                action["type"] = "select"
-            if action_type == "click":
-                risk_reason = _click_action_risk_reason(element, parent_state, action, raw_candidate, selector)
-                if risk_reason:
-                    errors.append(f"Risky click selector at {index}: {selector} ({risk_reason})")
+            element = selector_map.get(selector)
+            if not element:
+                if _dynamic_selector_allowed(raw_action, actions, raw_candidate):
+                    action["selector"] = selector
+                elif drop_unavailable:
                     continue
-            action["selector"] = selector
+                else:
+                    errors.append(f"Selector is not available in parent state at {index}: {selector}")
+                    continue
+            else:
+                if action_type == "fill" and (element.get("tag") or "").lower() == "select":
+                    action_type = "select"
+                    action["type"] = "select"
+                if action_type in POINTER_LLM_ACTION_TYPES:
+                    risk_reason = _click_action_risk_reason(element, parent_state, action, raw_candidate, selector)
+                    if risk_reason:
+                        errors.append(f"Risky {action_type} selector at {index}: {selector} ({risk_reason})")
+                        continue
+                action["selector"] = selector
         if action_type in {"fill", "select"}:
             value = str(raw_action.get("value") or "").strip()
             if not value:
@@ -3772,14 +3802,80 @@ def _normalize_llm_workflow_actions(
             action["allow_hidden"] = True
         actions.append(action)
 
-    return actions, errors
+    return _strip_parent_replay_prefix(actions, parent_state.get("replay_actions", [])), errors
+
+
+def _strip_parent_replay_prefix(actions: list[dict], replay_actions: list[dict]) -> list[dict]:
+    if not actions or not replay_actions:
+        return actions
+
+    prefix_length = 0
+    for candidate_action, replay_action in zip(actions, replay_actions):
+        if not _actions_equivalent_for_replay_prefix(candidate_action, replay_action):
+            break
+        prefix_length += 1
+
+    if prefix_length == 0:
+        return actions
+    return actions[prefix_length:]
+
+
+def _actions_equivalent_for_replay_prefix(left: dict, right: dict) -> bool:
+    if left.get("type") != right.get("type"):
+        return False
+    if left.get("selector") != right.get("selector"):
+        return False
+    action_type = left.get("type")
+    if action_type in {"fill", "select"}:
+        return str(left.get("value") or "") == str(right.get("value") or "")
+    if action_type == "press":
+        return str(left.get("key") or "Enter") == str(right.get("key") or "Enter")
+    return True
+
+
+def _dynamic_selector_allowed(raw_action: dict, previous_actions: list[dict], raw_candidate: dict) -> bool:
+    action_type = raw_action.get("type")
+    selector = str(raw_action.get("selector") or "").strip()
+    if action_type not in POST_REVEAL_DYNAMIC_SELECTOR_ACTION_TYPES or not selector:
+        return False
+    if not any(action.get("type") in REVEALING_LLM_ACTION_TYPES for action in previous_actions):
+        return False
+
+    text = _workflow_policy_text(
+        [
+            {
+                "type": action_type,
+                "selector": selector,
+                "description": raw_action.get("description"),
+                "key": raw_action.get("key"),
+            }
+        ],
+        raw_candidate,
+    )
+    if _has_high_risk_word(text):
+        return False
+    return _selector_looks_safe_for_dynamic_use(selector)
+
+
+def _selector_looks_safe_for_dynamic_use(selector: str) -> bool:
+    if len(selector) > 240:
+        return False
+    if re.search(r"[\n\r;{}]", selector):
+        return False
+    return True
 
 
 def _workflow_has_unavailable_selectors(raw_candidate: dict, state: dict) -> bool:
     selector_map = _selectors_for_state(state)
+    previous_actions = []
     for action in raw_candidate.get("actions", []):
-        if action.get("type") in {"click", "fill", "press", "select"} and action.get("selector") not in selector_map:
+        if (
+            action.get("type") in SELECTOR_LLM_ACTION_TYPES
+            and action.get("selector") not in selector_map
+            and not _dynamic_selector_allowed(action, previous_actions, raw_candidate)
+        ):
             return True
+        previous_actions.append(action)
     return False
 
 
@@ -3799,7 +3895,7 @@ def _best_state_for_llm_workflow(raw_candidate: dict, states_by_id: dict[str, di
             action_type = action.get("type")
             if action_type == "fill":
                 score += 3
-            elif action_type in {"click", "press"}:
+            elif action_type in POINTER_LLM_ACTION_TYPES or action_type == "press":
                 score += 2
             else:
                 score += 1
@@ -3870,13 +3966,13 @@ def _click_action_is_risky(element: dict, state: dict) -> bool:
 
 def _is_meaningful_workflow(actions: list[dict], candidate: dict | None = None) -> bool:
     action_types = {action.get("type") for action in actions}
-    if bool({"fill", "select"} & action_types) and bool({"click", "press"} & action_types):
+    if bool({"fill", "select"} & action_types) and bool({"click", "double_click", "press"} & action_types):
         return True
     return _has_safe_click_only_workflow_intent(actions, candidate)
 
 
 def _has_safe_click_only_workflow_intent(actions: list[dict], candidate: dict | None = None) -> bool:
-    if not any(action.get("type") in {"click", "press"} for action in actions):
+    if not any(action.get("type") in {"click", "double_click", "press"} for action in actions):
         return False
 
     text = _workflow_policy_text(actions, candidate)
@@ -4813,7 +4909,7 @@ def _dom_summary_script() -> str:
         .filter((text) => text.length > 1)
         .slice(0, maxTextBlocks);
 
-      const interactive = collect('button, [role="button"], a[href], input:not([type="hidden"]), textarea, select, summary, [tabindex]:not([tabindex="-1"])')
+      const interactive = collect('button, [role="button"], a[href], input:not([type="hidden"]), textarea, select, summary, label, [contenteditable="true"], [role="textbox"], [tabindex]:not([tabindex="-1"])')
         .sort((left, right) => {{
           if (left.bounds.y !== right.bounds.y) return left.bounds.y - right.bounds.y;
           return left.bounds.x - right.bounds.x;

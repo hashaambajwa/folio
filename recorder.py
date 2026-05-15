@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 
 RECORDER_VERSION = "0.1"
-SUPPORTED_ACTIONS = {"observe", "click", "fill", "press", "select", "navigate"}
+SUPPORTED_ACTIONS = {"observe", "click", "double_click", "fill", "press", "select", "navigate"}
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 DEFAULT_OBSERVE_SECONDS = 1.5
 VIEWPORT_SETTLE_MS = 250
@@ -210,6 +210,10 @@ async def _execute_action(
                         "(selector) => document.querySelector(selector)?.click()",
                         action.get("selector"),
                     )
+            await _wait_for_settle(page)
+        elif action_type == "double_click":
+            locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="minimal")
+            await locator.dblclick(timeout=action_timeout_ms)
             await _wait_for_settle(page)
         elif action_type == "fill":
             locator = await _ready_locator(page, action, action_timeout_ms, scroll_policy="none")
