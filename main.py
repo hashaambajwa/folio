@@ -28,6 +28,7 @@ from source_context import (
     MAX_TREE_ENTRIES,
     MAX_UI_STRINGS,
 )
+from validator import write_validation_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -244,6 +245,20 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--preset", default="veryfast", help="x264 encoding preset")
     render_parser.set_defaults(handler=handle_render)
 
+    validate_parser = subparsers.add_parser("validate", help="validate generated Folio output folders")
+    validate_parser.add_argument(
+        "run_paths",
+        nargs="+",
+        help="one or more output folders, or JSON artifacts inside output folders",
+    )
+    validate_parser.add_argument("--output", help="optional validation JSON output path")
+    validate_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat warnings as validation failures",
+    )
+    validate_parser.set_defaults(handler=handle_validate)
+
     return parser
 
 
@@ -452,6 +467,42 @@ def handle_render(args: argparse.Namespace) -> int:
         print(f"Failure: {result['failure']['message']}")
         return 1
     return 0
+
+
+def handle_validate(args: argparse.Namespace) -> int:
+    result = write_validation_report(
+        args.run_paths,
+        output_path=args.output,
+        strict=args.strict,
+    )
+
+    summary = result["summary"]
+    print(f"Validation {result['status']}: {summary['run_count']} run(s)")
+    print(f"Validation JSON: {result['artifacts']['validation_json']}")
+    print(f"Failures: {summary['failure_count']}")
+    print(f"Warnings: {summary['warning_count']}")
+    for run in result["runs"]:
+        metrics = run["metrics"]
+        plan = metrics.get("plan", {})
+        recording = metrics.get("recording", {})
+        render = metrics.get("render", {})
+        print(
+            "- "
+            f"{run['job_id']}: {run['status']} | "
+            f"coverage={plan.get('coverage_status')} "
+            f"paths={plan.get('selected_path_count')}/{plan.get('candidate_path_count')} "
+            f"scenes={plan.get('scene_count')} "
+            f"actions={recording.get('successful_action_count')}/{recording.get('action_count')} "
+            f"video={render.get('duration_seconds')}s"
+        )
+        for issue in run.get("failures", []):
+            print(f"  failure[{issue['code']}]: {issue['message']}")
+        for issue in run.get("warnings", [])[:5]:
+            print(f"  warning[{issue['code']}]: {issue['message']}")
+        if len(run.get("warnings", [])) > 5:
+            print(f"  ... {len(run['warnings']) - 5} more warning(s)")
+
+    return 1 if result["status"] == "failed" else 0
 
 
 def main(argv: list[str] | None = None) -> int:

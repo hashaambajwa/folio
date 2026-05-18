@@ -45,6 +45,18 @@ Expected final output:
 outputs/smoke/final.mp4
 ```
 
+Validate generated artifacts:
+
+```bash
+python main.py validate outputs/smoke
+```
+
+For cross-app smoke checks, pass multiple output folders and write an aggregate report:
+
+```bash
+python main.py validate outputs/todomvc-smoke outputs/grade-smoke --output outputs/phase1-validation.json
+```
+
 ## Current Pipeline
 
 ```text
@@ -55,6 +67,12 @@ renderer.py -> final.mp4 + render.json
 ```
 
 Generated artifacts live under `outputs/` and are ignored by git.
+
+## Phase 1 Validation
+
+`validate` inspects completed output folders without re-running the app. It checks scan depth, candidate paths, coverage status, selected workflow count, scene count, recording action success, render health, final video duration, repeated setup actions, and reset-heavy demos.
+
+Warnings are product-quality signals, not always hard failures. For example, repeated setup actions usually mean the engine should eventually chain workflows instead of resetting between every feature.
 
 ## Scanner Exploration
 
