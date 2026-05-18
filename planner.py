@@ -41,38 +41,6 @@ GENERIC_UTILITY_TERMS = (
     "site",
     "support",
 )
-GENERIC_FEATURE_STOPWORDS = {
-    "a",
-    "all",
-    "an",
-    "and",
-    "app",
-    "area",
-    "at",
-    "behavior",
-    "by",
-    "feature",
-    "for",
-    "from",
-    "in",
-    "item",
-    "items",
-    "label",
-    "labels",
-    "new",
-    "of",
-    "once",
-    "only",
-    "or",
-    "status",
-    "the",
-    "to",
-    "todo",
-    "todos",
-    "via",
-    "with",
-    "workflow",
-}
 OUTCOME_FOCUS_TERMS = (
     "answer",
     "calculation",
@@ -791,7 +759,9 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         selected_order = {path_id: index for index, path_id in enumerate(selected_path_ids)}
         covered_features.sort(key=lambda feature: selected_order.get(feature["path_id"], len(selected_order)))
 
-    missing_workflows = (ranker_payload or {}).get("missing_workflows", [])[:8]
+    ranker_missing_workflows = (ranker_payload or {}).get("missing_workflows", [])[:8]
+    audit_missing_workflows = _coverage_audit_missing_workflows(scan)
+    missing_workflows = [*ranker_missing_workflows, *audit_missing_workflows][:12]
     status = "complete" if selected_path_ids and not uncovered_features and not missing_workflows else "partial"
     if not selected_path_ids:
         status = "none"
@@ -803,6 +773,7 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
         "covered_features": covered_features,
         "uncovered_features": uncovered_features,
         "missing_workflows": missing_workflows,
+        "audit_missing_features": audit_missing_workflows,
         "redundant_paths": redundant_paths,
         "rejected_paths": [
             {"path_id": path_id, "reason": reason}
@@ -979,6 +950,27 @@ def _coverage_audit_feature_index(scan: dict) -> dict:
     }
 
 
+def _coverage_audit_missing_workflows(scan: dict) -> list[dict]:
+    audit = scan.get("coverage_audit") or {}
+    missing_workflows = []
+    for feature in audit.get("missing_features") or []:
+        feature_id = str(feature.get("feature_id") or _slug(feature.get("title") or "missing-feature"))
+        title = str(feature.get("title") or feature_id)
+        reason = str(feature.get("reason") or "Scanner coverage audit identified this feature as not yet validated.")
+        priority = str(feature.get("priority") or "unknown")
+        missing_workflows.append(
+            {
+                "feature_id": feature_id,
+                "title": title,
+                "priority": priority,
+                "reason": reason,
+                "source": "coverage_audit",
+                "blockers": feature.get("blockers") or [],
+            }
+        )
+    return missing_workflows
+
+
 def _coverage_audit_features_for_path(
     path_id: str,
     paths_by_id: dict[str, dict],
@@ -1125,20 +1117,7 @@ def _path_text_matches_feature(feature: dict, path_text: str) -> bool:
     feature_text = f"{feature.get('feature_id', '')} {feature.get('title', '')}".lower().replace("_", " ").replace("-", " ")
     if _feature_uses_domain_guard(feature_text):
         return _domain_feature_keyword_match(feature_text, path_text)
-    if _domain_feature_keyword_match(feature_text, path_text):
-        return True
-
-    feature_terms = [
-        term
-        for term in re.findall(r"[a-z0-9]+", feature_text)
-        if len(term) > 2 and term not in GENERIC_FEATURE_STOPWORDS
-    ]
-    if not feature_terms:
-        return False
-
-    matched_terms = {term for term in feature_terms if term in path_text}
-    required_count = 1 if len(feature_terms) == 1 else 2
-    return len(matched_terms) >= min(required_count, len(feature_terms))
+    return False
 
 
 def _feature_uses_domain_guard(feature_text: str) -> bool:
@@ -1148,19 +1127,47 @@ def _feature_uses_domain_guard(feature_text: str) -> bool:
         "completion",
         "create",
         "delete",
+        "disable",
         "destroy",
         "edit",
+        "enable",
+        "exclude",
         "filter",
+        "final",
+        "letter",
+        "letters",
         "multi",
         "multiple",
+        "percentage",
+        "print",
         "remove",
         "rename",
+        "row",
         "toggle",
+        "weighted",
     )
     return any(term in feature_text for term in guarded_terms)
 
 
 def _domain_feature_keyword_match(feature_text: str, path_text: str) -> bool:
+    if "weighted" in feature_text:
+        if "gpa calculator" in feature_text:
+            return "gpa calculator" in path_text and "weighted" in path_text
+        return "weighted" in path_text
+    if "percentage" in feature_text:
+        if "gpa calculator" in feature_text:
+            return "gpa calculator" in path_text and "percentage" in path_text
+        if "grade calculator" in feature_text:
+            return "label:grade calculator" in path_text and "percentage" in path_text
+        return "percentage" in path_text
+    if "letter" in feature_text:
+        return "letter" in path_text or "label:on" in path_text
+    if "row" in feature_text and ("enable" in feature_text or "disable" in feature_text or "exclude" in feature_text):
+        return "exclude" in path_text or "checkbox" in path_text or "label:on" in path_text
+    if "final grade" in feature_text:
+        return "label:final grade calculator" in path_text or "final grade calculator" in path_text
+    if "print" in feature_text:
+        return "print" in path_text
     if "clear" in feature_text:
         return "clear" in path_text
     if "delete" in feature_text or "destroy" in feature_text:
