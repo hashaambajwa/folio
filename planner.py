@@ -21,6 +21,7 @@ MAX_LLM_INTERACTIVE_ELEMENTS = 60
 MIN_LLM_COVERAGE_SCORE = 0.65
 MIN_LLM_PRODUCT_WORKFLOW_SCORE = 0.45
 REDUNDANT_PREFIX_SCORE_MARGIN = 0.08
+REPRESENTATIVE_KEEP_SCORE = 0.9
 GENERIC_FEATURE_LABELS = {
     "about",
     "calculators",
@@ -40,6 +41,38 @@ GENERIC_UTILITY_TERMS = (
     "site",
     "support",
 )
+GENERIC_FEATURE_STOPWORDS = {
+    "a",
+    "all",
+    "an",
+    "and",
+    "app",
+    "area",
+    "at",
+    "behavior",
+    "by",
+    "feature",
+    "for",
+    "from",
+    "in",
+    "item",
+    "items",
+    "label",
+    "labels",
+    "new",
+    "of",
+    "once",
+    "only",
+    "or",
+    "status",
+    "the",
+    "to",
+    "todo",
+    "todos",
+    "via",
+    "with",
+    "workflow",
+}
 OUTCOME_FOCUS_TERMS = (
     "answer",
     "calculation",
@@ -729,6 +762,13 @@ def _build_coverage_plan(scan: dict, ranker_payload: dict | None = None) -> dict
             selected_items,
             paths_by_id,
         )
+        selected_path_ids, feature_redundant_paths = _prune_redundant_feature_path_ids(
+            selected_path_ids,
+            selected_items,
+            paths_by_id,
+            scan,
+        )
+        redundant_paths.extend(feature_redundant_paths)
 
     selected_path_id_set = set(selected_path_ids)
     covered_features = [
@@ -807,6 +847,345 @@ def _prune_redundant_prefix_path_ids(
         for path_id, covered_by_path_id in pruned_by.items()
     ]
     return kept_path_ids, redundant_paths
+
+
+def _prune_redundant_feature_path_ids(
+    selected_path_ids: list[str],
+    selected_items: list[dict],
+    paths_by_id: dict[str, dict],
+    scan: dict,
+) -> tuple[list[str], list[dict]]:
+    feature_index = _coverage_audit_feature_index(scan)
+    if not feature_index["features_by_id"]:
+        return selected_path_ids, []
+
+    item_by_id = {item["path_id"]: item for item in selected_items}
+    feature_sets_by_path_id = {
+        path_id: _coverage_audit_features_for_path(path_id, paths_by_id, feature_index)
+        for path_id in selected_path_ids
+    }
+    feature_sets_by_path_id = {
+        path_id: feature_ids
+        for path_id, feature_ids in feature_sets_by_path_id.items()
+        if feature_ids
+    }
+    if not feature_sets_by_path_id:
+        return selected_path_ids, []
+
+    required_feature_ids = set().union(*feature_sets_by_path_id.values())
+    low_value_path_ids = feature_index["low_value_path_ids"]
+    selected_order = {path_id: index for index, path_id in enumerate(selected_path_ids)}
+    kept_path_ids: list[str] = []
+    covered_feature_ids: set[str] = set()
+
+    while required_feature_ids - covered_feature_ids:
+        candidates = [
+            path_id
+            for path_id in selected_path_ids
+            if path_id in feature_sets_by_path_id and path_id not in kept_path_ids
+        ]
+        if not candidates:
+            break
+
+        best_path_id = max(
+            candidates,
+            key=lambda path_id: _representative_path_score(
+                path_id,
+                feature_sets_by_path_id[path_id],
+                covered_feature_ids,
+                item_by_id,
+                paths_by_id,
+                low_value_path_ids,
+                selected_order,
+            ),
+        )
+        kept_path_ids.append(best_path_id)
+        covered_feature_ids.update(feature_sets_by_path_id[best_path_id])
+
+    for path_id in selected_path_ids:
+        if path_id in kept_path_ids:
+            continue
+        if path_id in feature_sets_by_path_id:
+            continue
+
+        item = item_by_id.get(path_id, {})
+        if path_id not in low_value_path_ids and item.get("demo_value_score", 0) >= REPRESENTATIVE_KEEP_SCORE:
+            kept_path_ids.append(path_id)
+
+    kept_path_id_set = set(kept_path_ids)
+    ordered_kept_path_ids = [path_id for path_id in selected_path_ids if path_id in kept_path_id_set]
+    redundant_paths = []
+    for path_id in selected_path_ids:
+        if path_id in kept_path_id_set:
+            continue
+
+        feature_ids = feature_sets_by_path_id.get(path_id, set())
+        redundant_paths.append(
+            {
+                "path_id": path_id,
+                "covered_by_path_id": _covering_feature_path_id(
+                    path_id,
+                    feature_ids,
+                    ordered_kept_path_ids,
+                    feature_sets_by_path_id,
+                    item_by_id,
+                    paths_by_id,
+                ),
+                "reason": _feature_redundant_reason(path_id, feature_ids, feature_index),
+                "feature_ids": sorted(feature_ids),
+            }
+        )
+
+    return ordered_kept_path_ids, redundant_paths
+
+
+def _coverage_audit_feature_index(scan: dict) -> dict:
+    audit = scan.get("coverage_audit") or {}
+    features_by_id: dict[str, dict] = {}
+    path_ids_by_feature: dict[str, set[str]] = {}
+    direct_feature_ids_by_path_id: dict[str, set[str]] = {}
+
+    for feature in audit.get("covered_features") or []:
+        feature_id = str(feature.get("feature_id") or _slug(feature.get("title") or "feature"))
+        title = str(feature.get("title") or feature_id)
+        related_path_ids = {
+            str(path_id)
+            for path_id in feature.get("related_path_ids") or []
+            if path_id
+        }
+        if not feature_id or not related_path_ids:
+            continue
+
+        features_by_id[feature_id] = {
+            "feature_id": feature_id,
+            "title": title,
+            "related_path_ids": sorted(related_path_ids),
+        }
+        path_ids_by_feature[feature_id] = related_path_ids
+        for path_id in related_path_ids:
+            direct_feature_ids_by_path_id.setdefault(path_id, set()).add(feature_id)
+
+    low_value_path_ids = {
+        str(item.get("path_id"))
+        for item in audit.get("low_value_paths") or []
+        if item.get("path_id")
+    }
+
+    return {
+        "features_by_id": features_by_id,
+        "path_ids_by_feature": path_ids_by_feature,
+        "direct_feature_ids_by_path_id": direct_feature_ids_by_path_id,
+        "low_value_path_ids": low_value_path_ids,
+    }
+
+
+def _coverage_audit_features_for_path(
+    path_id: str,
+    paths_by_id: dict[str, dict],
+    feature_index: dict,
+) -> set[str]:
+    path = paths_by_id.get(path_id)
+    if not path:
+        return set()
+
+    feature_ids = set(feature_index["direct_feature_ids_by_path_id"].get(path_id, set()))
+    for related_path_id, related_feature_ids in feature_index["direct_feature_ids_by_path_id"].items():
+        if related_path_id == path_id:
+            continue
+        related_path = paths_by_id.get(related_path_id)
+        if related_path and _path_signature_starts_with(path, related_path):
+            feature_ids.update(related_feature_ids)
+
+    path_text = _path_search_text(path)
+    for feature_id, feature in feature_index["features_by_id"].items():
+        if _path_text_matches_feature(feature, path_text):
+            feature_ids.add(feature_id)
+
+    return feature_ids
+
+
+def _representative_path_score(
+    path_id: str,
+    feature_ids: set[str],
+    covered_feature_ids: set[str],
+    item_by_id: dict[str, dict],
+    paths_by_id: dict[str, dict],
+    low_value_path_ids: set[str],
+    selected_order: dict[str, int],
+) -> tuple:
+    item = item_by_id.get(path_id, {})
+    path = paths_by_id.get(path_id, {})
+    new_feature_ids = feature_ids - covered_feature_ids
+    action_types = set(path.get("action_types") or [])
+    product_action_count = len(action_types & {"click", "double_click", "fill", "press", "select"})
+    return (
+        len(new_feature_ids),
+        int(path_id not in low_value_path_ids),
+        int(item.get("has_presentable_outcome", False)),
+        len(feature_ids),
+        product_action_count,
+        float(item.get("demo_value_score") or 0),
+        int(item.get("heuristic_score") or 0),
+        len(path.get("transitions") or []),
+        -selected_order.get(path_id, 0),
+    )
+
+
+def _covering_feature_path_id(
+    path_id: str,
+    feature_ids: set[str],
+    kept_path_ids: list[str],
+    feature_sets_by_path_id: dict[str, set[str]],
+    item_by_id: dict[str, dict],
+    paths_by_id: dict[str, dict],
+) -> str | None:
+    candidates = [
+        kept_path_id
+        for kept_path_id in kept_path_ids
+        if feature_ids and feature_ids <= feature_sets_by_path_id.get(kept_path_id, set())
+    ]
+    if not candidates and feature_ids:
+        candidates = [
+            kept_path_id
+            for kept_path_id in kept_path_ids
+            if feature_ids & feature_sets_by_path_id.get(kept_path_id, set())
+        ]
+    if not candidates:
+        return kept_path_ids[0] if kept_path_ids else None
+
+    return max(
+        candidates,
+        key=lambda candidate_id: (
+            _feature_overlap_weight(feature_sets_by_path_id.get(candidate_id, set()) & feature_ids),
+            len(feature_sets_by_path_id.get(candidate_id, set()) & feature_ids),
+            item_by_id.get(candidate_id, {}).get("demo_value_score", 0),
+            int(item_by_id.get(candidate_id, {}).get("heuristic_score") or 0),
+            len(paths_by_id.get(candidate_id, {}).get("transitions") or []),
+        ),
+    )
+
+
+def _feature_overlap_weight(feature_ids: set[str]) -> int:
+    score = 0
+    for feature_id in feature_ids:
+        if "create" in feature_id or "toggle-single" in feature_id:
+            score += 1
+        else:
+            score += 3
+    return score
+
+
+def _feature_redundant_reason(path_id: str, feature_ids: set[str], feature_index: dict) -> str:
+    if path_id in feature_index["low_value_path_ids"]:
+        return "Coverage audit marks this as a low-value variant; a representative workflow covers the same feature area."
+    if feature_ids:
+        feature_titles = [
+            feature_index["features_by_id"].get(feature_id, {}).get("title", feature_id)
+            for feature_id in sorted(feature_ids)
+        ]
+        return f"A selected representative workflow covers this feature area: {', '.join(feature_titles[:3])}."
+    return "A selected representative workflow covers the same feature area with a clearer outcome."
+
+
+def _path_signature_starts_with(path: dict, prefix_path: dict) -> bool:
+    signature = _path_transition_signature(path)
+    prefix_signature = _path_transition_signature(prefix_path)
+    if not signature or not prefix_signature:
+        return False
+    if len(prefix_signature) >= len(signature):
+        return False
+    return signature[: len(prefix_signature)] == prefix_signature
+
+
+def _path_search_text(path: dict) -> str:
+    labels = [str(label or "") for label in path.get("labels", [])]
+    parts = [
+        *labels,
+        *[f"label:{_clean_transition_label(label).lower()}" for label in labels if label],
+        *[str(reason or "") for reason in path.get("selection_reasons", [])],
+        *[str(tag or "") for tag in path.get("quality_tags", [])],
+        *[str(kind or "") for kind in path.get("kinds", [])],
+        str(path.get("path_id") or ""),
+        str((path.get("final_state_summary") or {}).get("title") or ""),
+    ]
+    for transition in path.get("transitions") or []:
+        parts.append(str(transition.get("label") or ""))
+        parts.append(str(transition.get("kind") or ""))
+        for action in transition.get("actions") or []:
+            parts.append(str(action.get("type") or ""))
+            parts.append(str(action.get("description") or ""))
+            parts.append(str(action.get("selector") or ""))
+            parts.append(str(action.get("value") or ""))
+            parts.append(str(action.get("key") or ""))
+
+    return " ".join(parts).lower().replace("_", " ").replace("-", " ")
+
+
+def _path_text_matches_feature(feature: dict, path_text: str) -> bool:
+    feature_text = f"{feature.get('feature_id', '')} {feature.get('title', '')}".lower().replace("_", " ").replace("-", " ")
+    if _feature_uses_domain_guard(feature_text):
+        return _domain_feature_keyword_match(feature_text, path_text)
+    if _domain_feature_keyword_match(feature_text, path_text):
+        return True
+
+    feature_terms = [
+        term
+        for term in re.findall(r"[a-z0-9]+", feature_text)
+        if len(term) > 2 and term not in GENERIC_FEATURE_STOPWORDS
+    ]
+    if not feature_terms:
+        return False
+
+    matched_terms = {term for term in feature_terms if term in path_text}
+    required_count = 1 if len(feature_terms) == 1 else 2
+    return len(matched_terms) >= min(required_count, len(feature_terms))
+
+
+def _feature_uses_domain_guard(feature_text: str) -> bool:
+    guarded_terms = (
+        "add",
+        "clear",
+        "completion",
+        "create",
+        "delete",
+        "destroy",
+        "edit",
+        "filter",
+        "multi",
+        "multiple",
+        "remove",
+        "rename",
+        "toggle",
+    )
+    return any(term in feature_text for term in guarded_terms)
+
+
+def _domain_feature_keyword_match(feature_text: str, path_text: str) -> bool:
+    if "clear" in feature_text:
+        return "clear" in path_text
+    if "delete" in feature_text or "destroy" in feature_text:
+        return "delete" in path_text or "destroy" in path_text
+    if "remove" in feature_text:
+        return "remove" in path_text
+    if "edit" in feature_text or "rename" in feature_text:
+        return "edit" in path_text or "double click" in path_text or "inline" in path_text or "rename" in path_text
+    if "filter" in feature_text:
+        return (
+            "filter" in path_text
+            or "view only" in path_text
+            or "label:all" in path_text
+            or "label:active" in path_text
+            or "label:completed" in path_text
+        )
+    if "toggle all" in feature_text:
+        return "toggle all" in path_text or "untoggle all" in path_text
+    if "toggle" in feature_text or "completion" in feature_text:
+        return "toggle" in path_text or "complete one" in path_text
+    if "multi" in feature_text or "multiple" in feature_text:
+        return "multi" in path_text or "multiple" in path_text or "three" in path_text or "distinct" in path_text
+    if "create" in feature_text or "add" in feature_text:
+        return "create" in path_text or "add" in path_text or "submit" in path_text or "new todo" in path_text
+    return False
 
 
 def _covering_prefix_path_id(
