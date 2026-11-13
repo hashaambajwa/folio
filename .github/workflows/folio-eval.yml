@@ -1,0 +1,46 @@
+name: Folio reliability benchmark
+
+on:
+  push:
+    branches:
+      - main
+      - feature/agent-reliability-benchmark
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Generate full benchmark manifest
+        run: python -m folio_eval generate --output benchmarks/folio-browser-v1.json
+      - name: Chromium integration smoke test
+        env:
+          FOLIO_BROWSER_TEST: '1'
+        run: python -m unittest discover -s tests -v
+      - name: Evaluate 10 reference trajectories
+        run: python -m folio_eval run --count 10 --output outputs/ci-reference
+      - name: Publish benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: folio-eval-report
+          path: outputs/ci-reference/
+          if-no-files-found: ignore
