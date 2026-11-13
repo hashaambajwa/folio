@@ -1,6 +1,19 @@
 # Folio
 
-AI demo video generator engine prototype.
+**AI-powered browser exploration, demo generation, and reproducible agent evaluation.** Folio discovers web-app workflows, selects feature-coverage paths, records Playwright interactions and renders videos with FFmpeg. The reliability benchmark evaluates agent-generated actions independently of video production.
+
+## Agent reliability benchmark
+
+The repository now includes a reproducible **250-case benchmark** (50 variations each of create, complete, edit, delete and filter workflows on a local fixture), a candidate-agent evaluation interface, isolated Chromium execution, DOM assertions, secure structured tool actions, resumable checkpoints, redacted execution traces, latency summaries, paired comparisons and GitHub Actions regression checks.
+
+```bash
+python -m folio_eval generate --output benchmarks/folio-browser-v1.json
+python -m folio_eval run --count 5 --output outputs/eval-smoke
+python -m folio_eval run --suite benchmarks/folio-browser-v1.json --output outputs/eval-250
+python -m folio_eval compare outputs/baseline/report.json outputs/candidate/report.json
+```
+
+**Important:** the 250 scenarios are variations of five fixture workflows. Reference-pass results do not establish an LLM success rate. To evaluate real agents, supply model-generated action candidates; compare matched reports. See [evaluation documentation](docs/evaluation.md) for setup, examples, interpretation and limitations.
 
 ## Setup
 
