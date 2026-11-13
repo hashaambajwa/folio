@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 from folio_eval.checkpoint import Checkpoint, atomic_json, digest
+from folio_eval.compare import compare_paths
 from folio_eval.dataset import generate_suite, save_suite
 from folio_eval.runner import execute_suite_cases
 from folio_eval.schema import BenchmarkSuite, validate_action
@@ -87,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--resume", action="store_true", help="resume matching checkpoint")
     run_parser.add_argument("--timeout-ms", type=int, default=15000)
     run_parser.add_argument("--min-success-rate", type=float, default=1.0)
+    compare_parser = commands.add_parser("compare", help="compare paired results from identical suites")
+    compare_parser.add_argument("before", help="first run report.json")
+    compare_parser.add_argument("after", help="second run report.json")
+    compare_parser.add_argument("--output", help="optional JSON comparison path")
     site_parser = commands.add_parser("serve", help="serve the standalone benchmark fixture")
     site_parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
@@ -94,6 +99,15 @@ def main(argv: list[str] | None = None) -> int:
         suite = save_suite(args.output, args.count)
         print(f"Wrote {len(suite.cases)} cases to {args.output} ({suite.fingerprint})")
         return 0
+    if args.command == "compare":
+        try:
+            comparison = compare_paths(args.before, args.after)
+            if args.output:
+                atomic_json(args.output, comparison)
+            print(json.dumps(comparison, indent=2))
+            return 0
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            parser.error(str(exc))
     if args.command == "serve":
         serve(port=args.port)
         return 0
