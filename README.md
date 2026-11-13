@@ -1,5 +1,20 @@
 # Folio
 
+**Browser-agent workflow exploration, automated product demos, and reproducible reliability evaluation.**
+
+Folio explores web applications with Playwright, converts discovered interaction paths into product demonstrations, and renders recordings to video. Its separate evaluation harness validates agent-produced actions against deterministic browser outcomes.
+
+### At a glance
+
+| System | What is implemented | Evidence |
+| --- | --- | --- |
+| App exploration | Bounded state graph, candidate workflow discovery, optional LLM-guided goals and repair | Scanner/validator code and CLI |
+| Demo pipeline | Workflow planning, Playwright recording, FFmpeg output | Scan → plan → record → render |
+| Evaluation | Versioned synthetic suite, candidate actions, trace redaction, paired regression comparisons | 250 fixture variations across **five** workflows |
+| Reproducibility | Isolated browser contexts, resumable checkpoints, GitHub Actions smoke gate | [Evaluation guide](docs/evaluation.md) |
+
+> **Benchmark interpretation:** 250 cases are deterministic variations of five workflows on one local fixture, not 250 real sites. The suite establishes repeatable correctness checks; it does not establish a measured model success rate. See [architecture](docs/architecture.md) and [evaluation limitations](docs/evaluation.md).
+
 **AI-powered browser exploration, demo generation, and reproducible agent evaluation.** Folio discovers web-app workflows, selects feature-coverage paths, records Playwright interactions and renders videos with FFmpeg. The reliability benchmark evaluates agent-generated actions independently of video production.
 
 ## Agent reliability benchmark
