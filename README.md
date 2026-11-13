@@ -15,7 +15,7 @@ Folio explores web applications with Playwright, converts discovered interaction
 
 > **Benchmark interpretation:** 250 cases are deterministic variations of five workflows on one local fixture, not 250 real sites. The suite establishes repeatable correctness checks; it does not establish a measured model success rate. See [architecture](docs/architecture.md) and [evaluation limitations](docs/evaluation.md).
 
-**AI-powered browser exploration, demo generation, and reproducible agent evaluation.** Folio discovers web-app workflows, selects feature-coverage paths, records Playwright interactions and renders videos with FFmpeg. The reliability benchmark evaluates agent-generated actions independently of video production.
+The implementation supports exploratory scanning, replayable workflow planning, recording, video rendering and an independent evaluation package. See the commands below for reproducible runs.
 
 ## Agent reliability benchmark
 
